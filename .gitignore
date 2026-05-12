@@ -29,6 +29,10 @@ installer/output/
 *.swp
 *.swo
 
+# --- Claude Code (per-utente, non da committare) ---
+.claude/
+settings.local.json
+
 # --- Logs ---
 *.log
 
