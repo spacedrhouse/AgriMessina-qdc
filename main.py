@@ -37,7 +37,7 @@ try:
 except ImportError:
     APP_VERSION = "0.0.0-dev"
 from local_db import get_engine, init_local_database, reset_sync_state
-from sync import sync_all, reconcile_with_server, pull_trattamenti
+from sync import sync_all, reconcile_with_server, pull_trattamenti, pull_movimenti
 from pending_uploader import upload_pending
 from login_dialog import LoginDialog
 from sync_notifier import SyncNotifier
@@ -598,10 +598,6 @@ class FinestraPrincipale(QMainWindow):
                                 page.aggiorna_dati()
                             except Exception as e:
                                 log.error("Pull-UI: errore refresh: %s", e)
-                # Notifica per i pannelli magazzino: pull_trattamenti ha già
-                # invocato sincronizza_scarico tramite _upsert_trattamenti,
-                # quindi registro_magazzino può essere variato.
-                self.notifier.trattamento_changed.emit()
                 # Online state
                 self.notifier.online = True
                 self.notifier.state("idle")
@@ -624,6 +620,36 @@ class FinestraPrincipale(QMainWindow):
             log.debug("Pull realtime offline: %s", e)
         except Exception as e:
             log.warning("Pull errore: %s", e)
+        finally:
+            self._is_syncing = False
+
+    def _pull_movimenti_realtime(self):
+        """Pull leggero del registro magazzino. Triggerato dall'evento SSE
+        `magazzino_changed`: quando un altro client (es. app mobile) crea
+        un trattamento, il backend genera gli scarichi automatici via
+        sincronizza_scarico. Senza questo pull dedicato gli scarichi
+        nuovi apparivano sul desktop solo al reconcile a 30 min."""
+        self._is_syncing = True
+        try:
+            aggiunti, cancellati = pull_movimenti(self.api, self.engine, notifier=self.notifier)
+            if aggiunti or cancellati:
+                log.info("Pull movimenti: +%d/-%d", aggiunti, cancellati)
+                # Refresh dei pannelli magazzino (3 viste per azienda).
+                # Emette il signal su SyncNotifier: i PannelloProdotti lo
+                # ascoltano e ricaricano aggiorna_dati() asincronamente.
+                self.notifier.trattamento_changed.emit()
+                self.notifier.online = True
+                self.notifier.state("idle")
+        except NotAuthenticatedError:
+            self._is_syncing = False
+            self._handle_session_expired()
+            return
+        except NetworkError as e:
+            self.notifier.online = False
+            self.notifier.state("offline")
+            log.debug("Pull movimenti offline: %s", e)
+        except Exception as e:
+            log.warning("Pull movimenti errore: %s", e)
         finally:
             self._is_syncing = False
 
@@ -708,12 +734,22 @@ class FinestraPrincipale(QMainWindow):
                 QMessageBox.warning(self, "Sincronizzazione", f"❌ {result.message}")
 
     def _on_server_event(self, event_type: str, payload: dict):
-        """Riceve un evento SSE dal backend e triggera un pull immediato.
+        """Riceve un evento SSE dal backend e triggera un pull mirato.
 
-        Esempi di event_type: trattamenti_changed, magazzino_changed,
-        avvisi_changed. Il pull leggero (pull_trattamenti) è preferibile a
-        un full sync_all perché bastano i delta — il timer di reconcile a
-        intervallo lungo continua a fare il pulizia periodica fantasmi.
+        Mappa event_type → pull dell'entità che è effettivamente cambiata:
+          - trattamenti_changed → pull_trattamenti (+ avvisi a cascata)
+          - magazzino_changed   → pull_movimenti (gli auto-scarichi del
+                                  backend non arrivavano al desktop senza
+                                  questo ramo dedicato)
+          - avvisi_changed      → coperto dal pull_trattamenti che
+                                  rinfresca anche gli avvisi quando il
+                                  delta è non-vuoto; nel caso "solo avvisi
+                                  cambiati" facciamo comunque il pull
+                                  trattamenti (cheap, since-based)
+
+        Il pull leggero è preferibile a sync_all perché basta il delta;
+        il timer di reconcile a intervallo lungo continua a fare la
+        pulizia periodica dei fantasmi.
         """
         if self._is_syncing:
             # Già un sync in corso: l'evento verrà coperto dal sync corrente
@@ -721,7 +757,12 @@ class FinestraPrincipale(QMainWindow):
             return
         log.debug("[events] ricevuto %s: %s", event_type, payload)
         try:
-            self._pull_trattamenti_realtime()
+            if event_type == "magazzino_changed":
+                self._pull_movimenti_realtime()
+            else:
+                # trattamenti_changed, avvisi_changed, e qualsiasi tipo
+                # sconosciuto futuro: pull trattamenti+avvisi.
+                self._pull_trattamenti_realtime()
         except Exception as e:
             log.warning("[events] pull immediato fallito: %s", e)
 
@@ -807,6 +848,8 @@ class FinestraPrincipale(QMainWindow):
 
         Filtro: solo eventi trattamenti_changed con op INSERT/DELETE (le
         UPDATE generano troppo rumore e l'utente le vede comunque nella UI).
+        Soppressione "eco": se l'op l'abbiamo appena pushata noi, niente
+        notifica (sarebbe fuorviante dire "da un altro client").
         Throttle: niente notifiche più frequenti di una ogni 5s.
         """
         import time
@@ -820,18 +863,25 @@ class FinestraPrincipale(QMainWindow):
         if op not in ("INSERT", "DELETE"):
             return
 
+        tid = (payload or {}).get("id")
+        # Anti-eco: se questa op è stata appena pushata da NOI, l'evento
+        # SSE è il rimbalzo del nostro stesso push. Il pending_uploader ha
+        # marcato l'id in notifier.mark_recent_local; saltiamo il toast.
+        if tid is not None and self.notifier.was_recent_local("TRATTAMENTO", tid):
+            return
+
         now = time.time()
         if now - self._last_notify_ts < self._NOTIFY_THROTTLE_S:
             return
         self._last_notify_ts = now
 
-        tid = (payload or {}).get("id", "?")
+        tid_str = tid if tid is not None else "?"
         if op == "INSERT":
             title = "Nuovo trattamento"
-            body = f"Trattamento #{tid} aggiunto da un altro client."
+            body = f"Trattamento #{tid_str} aggiunto da un altro client."
         else:
             title = "Trattamento cancellato"
-            body = f"Trattamento #{tid} rimosso da un altro client."
+            body = f"Trattamento #{tid_str} rimosso da un altro client."
 
         # 4000 ms = durata default del toast su Windows/Linux. Su macOS
         # è ignorato (li gestisce il Notification Center).

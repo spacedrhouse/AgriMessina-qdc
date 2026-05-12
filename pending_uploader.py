@@ -297,11 +297,16 @@ def upload_pending(api: ApiClient, engine: Engine, notifier=None) -> tuple[int, 
             resp = _call_api(api, engine, op, payload)
 
             pending_op_deleted = False
+            # ID effettivo lato server dopo eventuale swap: per INSERT è il
+            # nuovo id assegnato dal backend, per UPDATE/DELETE/AUTORIZZA/REVOCA
+            # è l'eid che avevamo già (record sincronizzato in precedenza).
+            server_id = eid
             if ot == "INSERT":
                 had_insert = True
                 new_id = _extract_new_id(resp)
                 table = ENTITY_TO_TABLE.get(et)
                 if new_id is not None and table:
+                    server_id = new_id
                     if str(new_id) != str(eid):
                         _apply_id_swap(engine, et, table, eid, new_id, op["id"], pending)
                         pending_op_deleted = True
@@ -313,6 +318,13 @@ def upload_pending(api: ApiClient, engine: Engine, notifier=None) -> tuple[int, 
             if not pending_op_deleted:
                 _delete_op(engine, op["id"])
             sent_ok += 1
+
+            # Segna l'op come "nostra" per sopprimere l'eco SSE che arriverà
+            # da lì a pochi millisecondi. Senza, il toast tray dice
+            # "Trattamento #X aggiunto/eliminato da un altro client" anche
+            # quando il modificatore sei tu.
+            if notifier is not None and hasattr(notifier, "mark_recent_local"):
+                notifier.mark_recent_local(et, server_id)
 
         except NotAuthenticatedError:
             # 401/403: token JWT scaduto/revocato. Non incrementiamo retry_count:

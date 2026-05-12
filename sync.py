@@ -486,6 +486,43 @@ def pull_trattamenti(api: ApiClient, engine: Engine, notifier=None) -> tuple:
         set_downloading(engine, False)
 
 
+def pull_movimenti(api: ApiClient, engine: Engine, notifier=None) -> tuple:
+    """Pull incrementale dei SOLI movimenti magazzino dal server.
+
+    Pensata per essere chiamata quando arriva un SSE `magazzino_changed`:
+    senza, gli scarichi automatici generati server-side a fronte di un
+    trattamento creato da un altro client (es. Android) non comparivano
+    nel desktop fino al prossimo reconcile a 30 min.
+
+    Stessa logica di pull_trattamenti: usa `since` per il delta minimo
+    e protegge gli ID con pending op locali (CARICHI/SCARICHI manuali
+    creati offline che non sono ancora arrivati al server).
+
+    Ritorna (n_aggiunti_o_modificati, n_cancellati).
+    """
+    if not api.is_authenticated:
+        return (0, 0)
+
+    set_downloading(engine, True)
+    try:
+        since = get_sync_since(engine, E_MAGAZZINO)
+        resp = api.sync_movimenti(since=since)
+        items = resp.get("items", [])
+        deleted_ids = resp.get("deleted_ids", [])
+
+        protected = _protected_ids_for(engine, "MOVIMENTO")
+        safe_items = [it for it in items if it.get("id") not in protected]
+        safe_deletes = [i for i in deleted_ids if i not in protected]
+
+        _delete_ids(engine, "registro_magazzino", safe_deletes)
+        _upsert_movimenti(engine, safe_items)
+        set_sync_since(engine, E_MAGAZZINO, resp["server_time"])
+
+        return (len(safe_items), len(safe_deletes))
+    finally:
+        set_downloading(engine, False)
+
+
 def sync_all(api: ApiClient, engine: Engine) -> SyncResult:
     """Esegue una sync incrementale di tutte le entità."""
     if not api.is_authenticated:

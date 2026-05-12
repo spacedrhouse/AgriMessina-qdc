@@ -59,6 +59,14 @@ class SyncNotifier(QObject):
         self.last_successful_reconcile_ts: float = 0.0
         # Flag: la rete è attualmente raggiungibile?
         self.online: bool = True
+        # Tracking delle op locali appena pushate: serve a sopprimere le
+        # notifiche "Trattamento #X aggiunto/eliminato da un altro client"
+        # quando in realtà sei stato TU a farlo. Il SSE non distingue il
+        # mittente, quindi lo facciamo noi: chiave (entity_type, entity_id),
+        # valore timestamp. Le voci più vecchie di _RECENT_LOCAL_TTL_S
+        # vengono considerate "non più nostre" (per coprire un eventuale
+        # secondo cambio dello stesso ID da un altro client).
+        self._recent_local_ids: dict[tuple[str, int], float] = {}
 
     # ---- API per i moduli di sync (duck typing-safe) ----
 
@@ -99,3 +107,44 @@ class SyncNotifier(QObject):
 
     def recent_events(self, limit: int = 50) -> list[SyncEvent]:
         return list(reversed(self._events[-limit:]))
+
+    # ---- Tracking op locali (anti-eco SSE) ---------------------------------
+
+    # Finestra di "appena nostro" per la soppressione delle notifiche eco.
+    # Più lungo di RTT + qualche centinaio di ms di buffering Plesk/nginx,
+    # più corto del ciclo di reconcile per non sopprimere eventi reali.
+    _RECENT_LOCAL_TTL_S = 10.0
+
+    def mark_recent_local(self, entity_type: str, entity_id) -> None:
+        """Segna l'operazione come fatta da QUESTO client. Chiamato dal
+        pending_uploader subito dopo una push riuscita: poco dopo arriverà
+        l'eco SSE dal server, e `was_recent_local` la riconoscerà come
+        nostra evitando di notificare "modificato da un altro client"."""
+        if entity_id is None:
+            return
+        try:
+            key = (entity_type, int(entity_id))
+        except (TypeError, ValueError):
+            return
+        import time
+        self._recent_local_ids[key] = time.time()
+
+    def was_recent_local(self, entity_type: str, entity_id) -> bool:
+        """True se l'op è stata fatta da noi entro _RECENT_LOCAL_TTL_S."""
+        if entity_id is None:
+            return False
+        try:
+            key = (entity_type, int(entity_id))
+        except (TypeError, ValueError):
+            return False
+        import time
+        ts = self._recent_local_ids.get(key)
+        if ts is None:
+            return False
+        now = time.time()
+        if now - ts > self._RECENT_LOCAL_TTL_S:
+            # Voce scaduta: pulisce in coda al check così il dict non
+            # cresce indefinitamente. Costo amortizzato O(1) per accesso.
+            del self._recent_local_ids[key]
+            return False
+        return True
