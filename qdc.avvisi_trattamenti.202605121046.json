@@ -1,0 +1,15 @@
+{
+"avvisi_trattamenti": [
+	{
+		"id" : 7379,
+		"trattamento_id" : 302,
+		"testo" : "⚠️ Dose Bassa su ZV10: Calcolata 1.5 l\/ha per «3Logy» (minimo etichetta: 4.0).",
+		"updated_at" : "2026-05-12 10:31:45"
+	},
+	{
+		"id" : 7380,
+		"trattamento_id" : 303,
+		"testo" : "⚠️ Dose Eccessiva su DF1: Calcolata 10.0 g\/hl per «Berelex 40 SG» (massimo etichetta: 7.5).",
+		"updated_at" : "2026-05-12 10:31:45"
+	}
+]}

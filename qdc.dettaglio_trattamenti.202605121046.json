@@ -1,0 +1,23 @@
+{
+"dettaglio_trattamenti": [
+	{
+		"id" : 711,
+		"trattamento_id" : 302,
+		"tendone_id" : 14,
+		"quantita_sostanza" : 1.0,
+		"botti" : 1.0,
+		"dose_ha" : 1.4607,
+		"is_bilanciamento" : 0,
+		"updated_at" : "2026-05-12 10:30:57"
+	},
+	{
+		"id" : 712,
+		"trattamento_id" : 303,
+		"tendone_id" : 93,
+		"quantita_sostanza" : 100.0,
+		"botti" : 1.0,
+		"dose_ha" : 44.0567,
+		"is_bilanciamento" : 0,
+		"updated_at" : "2026-05-12 10:31:45"
+	}
+]}

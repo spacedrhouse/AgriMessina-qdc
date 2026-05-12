@@ -1,0 +1,59 @@
+{
+"registro_magazzino": [
+	{
+		"id" : 60,
+		"prodotto_id" : 1,
+		"azienda_id" : 1,
+		"data_movimento" : "2026-05-06",
+		"tipo_movimento" : "CARICO",
+		"quantita" : 200.0,
+		"n_ddt" : "12345",
+		"fornitore" : "Agrisana",
+		"note" : null,
+		"updated_at" : "2026-05-06 15:22:41",
+		"trattamento_id" : null,
+		"azienda_id_origine" : null
+	},
+	{
+		"id" : 84,
+		"prodotto_id" : 41,
+		"azienda_id" : 26,
+		"data_movimento" : "2026-05-11",
+		"tipo_movimento" : "CARICO",
+		"quantita" : 1000.0,
+		"n_ddt" : "12349",
+		"fornitore" : "Agrisana",
+		"note" : null,
+		"updated_at" : "2026-05-11 15:45:24",
+		"trattamento_id" : null,
+		"azienda_id_origine" : null
+	},
+	{
+		"id" : 91,
+		"prodotto_id" : 1,
+		"azienda_id" : 1,
+		"data_movimento" : "2026-05-12",
+		"tipo_movimento" : "SCARICO",
+		"quantita" : 1.0,
+		"n_ddt" : null,
+		"fornitore" : null,
+		"note" : "Scarico automatico T#302",
+		"updated_at" : "2026-05-12 10:32:12",
+		"trattamento_id" : 302,
+		"azienda_id_origine" : 1
+	},
+	{
+		"id" : 92,
+		"prodotto_id" : 41,
+		"azienda_id" : 26,
+		"data_movimento" : "2026-05-12",
+		"tipo_movimento" : "SCARICO",
+		"quantita" : 100.0,
+		"n_ddt" : null,
+		"fornitore" : null,
+		"note" : "Scarico automatico T#303",
+		"updated_at" : "2026-05-12 10:32:12",
+		"trattamento_id" : 303,
+		"azienda_id_origine" : 277
+	}
+]}

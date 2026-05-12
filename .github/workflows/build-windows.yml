@@ -1,0 +1,83 @@
+name: Build Windows Installer
+
+on:
+  push:
+    tags:
+      - 'v*'
+  workflow_dispatch:
+    inputs:
+      version:
+        description: 'Versione (es. 1.0.0). Per release ufficiali usare invece un git tag vX.Y.Z.'
+        required: false
+        default: '0.0.0-dev'
+
+jobs:
+  build:
+    runs-on: windows-latest
+    timeout-minutes: 30
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+          cache: 'pip'
+
+      - name: Determina versione
+        id: version
+        shell: bash
+        run: |
+          if [[ "${{ github.ref_type }}" == "tag" ]]; then
+            # github.ref_name = "v1.2.3" → strip della "v" → "1.2.3"
+            VERSION="${GITHUB_REF_NAME#v}"
+          else
+            VERSION="${{ github.event.inputs.version }}"
+            [[ -z "$VERSION" ]] && VERSION="0.0.0-dev"
+          fi
+          echo "version=$VERSION" >> "$GITHUB_OUTPUT"
+          echo "Versione build: $VERSION"
+
+      - name: Install dipendenze Python
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
+          pip install pyinstaller pandas openpyxl
+
+      - name: Build con PyInstaller (--onedir)
+        run: pyinstaller AgriMessina.spec --noconfirm --clean
+
+      - name: Smoke test del bundle
+        # Verifica che l'.exe sia stato creato. Non lo lanciamo (GUI senza display
+        # nel runner CI), ma controllarne l'esistenza basta per fail-fast.
+        shell: bash
+        run: |
+          test -f "dist/AgriMessina/AgriMessina.exe" || { echo "AgriMessina.exe non creato"; exit 1; }
+          ls -la dist/AgriMessina/AgriMessina.exe
+
+      - name: Install Inno Setup
+        run: choco install innosetup -y --no-progress
+
+      - name: Build installer Inno Setup
+        shell: cmd
+        run: |
+          "C:\Program Files (x86)\Inno Setup 6\ISCC.exe" /DAppVersion=${{ steps.version.outputs.version }} installer\AgriMessina.iss
+
+      - name: Carica installer come artifact CI
+        uses: actions/upload-artifact@v4
+        with:
+          name: AgriMessina-installer-${{ steps.version.outputs.version }}
+          path: installer/output/*.exe
+          if-no-files-found: error
+          retention-days: 30
+
+      - name: Pubblica come Release GitHub (solo su push di tag)
+        if: github.event_name == 'push' && github.ref_type == 'tag'
+        uses: softprops/action-gh-release@v2
+        with:
+          files: installer/output/*.exe
+          generate_release_notes: true
+          name: AgriMessina QDC ${{ steps.version.outputs.version }}
+          tag_name: ${{ github.ref_name }}

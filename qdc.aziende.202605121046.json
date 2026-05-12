@@ -1,0 +1,23 @@
+{
+"aziende": [
+	{
+		"id" : 1,
+		"nome" : "Agrimessina",
+		"updated_at" : "2026-05-06 12:11:50"
+	},
+	{
+		"id" : 26,
+		"nome" : "Messina Alfio",
+		"updated_at" : "2026-05-06 12:11:50"
+	},
+	{
+		"id" : 82,
+		"nome" : "La Gazzella",
+		"updated_at" : "2026-05-06 12:11:50"
+	},
+	{
+		"id" : 277,
+		"nome" : "Deflorio Ciccopinto",
+		"updated_at" : "2026-05-06 12:11:50"
+	}
+]}

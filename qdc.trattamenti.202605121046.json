@@ -1,0 +1,27 @@
+{
+"trattamenti": [
+	{
+		"id" : 302,
+		"data_trattamento" : "2026-05-12",
+		"data_inserimento" : "2026-05-12 08:30:57",
+		"prodotto_id" : 1,
+		"operatore" : "Giampiero Cannone",
+		"tipo_trattamento" : "Difesa",
+		"modalita_fertilizzazione" : null,
+		"scaricato_magazzino" : "0",
+		"updated_at" : "2026-05-12 10:30:57",
+		"is_autorizzato" : 0
+	},
+	{
+		"id" : 303,
+		"data_trattamento" : "2026-05-12",
+		"data_inserimento" : "2026-05-12 08:31:46",
+		"prodotto_id" : 41,
+		"operatore" : "Giampiero Cannone",
+		"tipo_trattamento" : "Fertilizzazione",
+		"modalita_fertilizzazione" : "Fogliare",
+		"scaricato_magazzino" : "0",
+		"updated_at" : "2026-05-12 10:31:45",
+		"is_autorizzato" : 0
+	}
+]}

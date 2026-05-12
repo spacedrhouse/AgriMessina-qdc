@@ -1,0 +1,46 @@
+# --- Python ---
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+.Python
+
+# --- Venv ---
+# Attualmente qdc/ è una mixed venv+sources dir: queste path sono
+# l'output di `python -m venv`. Non vanno committate.
+bin/
+include/
+lib/
+lib64/
+pyvenv.cfg
+.venv/
+venv/
+
+# --- PyInstaller output ---
+build/
+dist/
+
+# --- Inno Setup output ---
+installer/output/
+
+# --- Editors / IDE ---
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# --- Logs ---
+*.log
+
+# --- DB locali / cache utente ---
+*.db
+*.db-shm
+*.db-wal
+.agrimessina/
+
+# --- Excel exports di test (sample) ---
+Movimenti_Magazzino.xlsx
+Trattamenti_Revisionati.xlsx
+
+# --- Legacy / dipendenze native non più necessarie ---
+libmariadb.dll
