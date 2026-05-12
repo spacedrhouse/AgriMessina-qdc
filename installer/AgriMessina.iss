@@ -11,9 +11,10 @@
 #endif
 
 #define AppName       "AgriMessina QDC"
-#define AppPublisher  "AgriMessina"
+#define AppPublisher  "Domenico Loiotine"
 #define AppURL        "https://agrimessina.it"
 #define AppExeName    "AgriMessina.exe"
+#define AppCopyright  "Copyright (c) 2026 Domenico Loiotine. All rights reserved."
 
 [Setup]
 ; AppId è il fingerprint dell'app per il sistema di disinstallazione di Windows.
@@ -27,13 +28,19 @@ AppPublisher={#AppPublisher}
 AppPublisherURL={#AppURL}
 AppSupportURL={#AppURL}
 AppUpdatesURL={#AppURL}
+AppCopyright={#AppCopyright}
 DefaultDirName={autopf}\AgriMessina
 DefaultGroupName=AgriMessina
 DisableProgramGroupPage=auto
 OutputBaseFilename=AgriMessina_Setup_{#AppVersion}
-OutputDir=installer\output
-SetupIconFile=icona.ico
+; Path relativi al file .iss (che vive in installer/). `output` qui significa
+; installer/output/ — coerente col workflow CI che ci pesca gli artifact.
+OutputDir=output
+SetupIconFile=..\icona.ico
 UninstallDisplayIcon={app}\{#AppExeName}
+; LICENSE mostrato in una pagina del wizard di installazione. L'utente la
+; deve accettare prima di proseguire.
+LicenseFile=..\LICENSE
 Compression=lzma2/ultra
 SolidCompression=yes
 WizardStyle=modern
