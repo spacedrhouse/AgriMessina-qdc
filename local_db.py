@@ -129,6 +129,17 @@ def init_local_database(engine: Engine) -> None:
             note TEXT
         )"""))
 
+        # Migrazione idempotente per DB pre-esistenti (creati da versioni
+        # precedenti al campo `azienda_id_origine`): se la tabella esiste già
+        # ma manca la colonna, CREATE TABLE IF NOT EXISTS è no-op e l'indice
+        # successivo crasherebbe. ALTER TABLE è l'unico modo per aggiungerla
+        # senza perdere i dati.
+        cols_rm = {r[1] for r in conn.execute(text("PRAGMA table_info(registro_magazzino)")).fetchall()}
+        if "azienda_id_origine" not in cols_rm:
+            conn.execute(text(
+                "ALTER TABLE registro_magazzino ADD COLUMN azienda_id_origine INTEGER REFERENCES aziende(id)"
+            ))
+
         # Indici espliciti su colonne usate pesantemente in WHERE/IN dalle
         # query magazzino (`WHERE rm.azienda_id IN (...)`). SQLite NON
         # auto-indicizza le foreign key, e senza queste le viste per-azienda
@@ -173,6 +184,15 @@ def init_local_database(engine: Engine) -> None:
             last_error TEXT,
             created_at DATETIME DEFAULT CURRENT_TIMESTAMP
         )"""))
+
+        # Migrazione idempotente per DB pre-esistenti senza retry_count/last_error.
+        # CREATE TABLE IF NOT EXISTS è no-op se la tabella esiste già, quindi
+        # l'unica via per aggiungere i campi a un DB vecchio è ALTER TABLE.
+        cols_po = {r[1] for r in conn.execute(text("PRAGMA table_info(pending_operations)")).fetchall()}
+        if "retry_count" not in cols_po:
+            conn.execute(text("ALTER TABLE pending_operations ADD COLUMN retry_count INTEGER NOT NULL DEFAULT 0"))
+        if "last_error" not in cols_po:
+            conn.execute(text("ALTER TABLE pending_operations ADD COLUMN last_error TEXT"))
 
         # Dead-letter: operazioni fallite definitivamente (oltre retry_count_max).
         # Conservate per audit/recupero manuale, mai ritentate automaticamente.
