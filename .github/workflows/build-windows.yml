@@ -11,6 +11,12 @@ on:
         required: false
         default: '0.0.0-dev'
 
+# Permessi minimi per il GITHUB_TOKEN: senza `contents: write` softprops/action-gh-release
+# fallisce con 403 "Resource not accessible by integration" quando prova a creare la
+# release. Tutto il resto resta read (default repository settings).
+permissions:
+  contents: write
+
 jobs:
   build:
     runs-on: windows-latest
