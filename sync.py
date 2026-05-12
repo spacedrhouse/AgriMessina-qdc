@@ -7,7 +7,6 @@ Stessa logica del SyncManager Android:
 - Salva il `server_time` per usarlo come `since` la prossima volta.
 """
 from __future__ import annotations
-from typing import Optional, Tuple
 
 from sqlalchemy import text
 from sqlalchemy.engine import Engine
@@ -31,13 +30,16 @@ E_MAGAZZINO = "magazzino"
 E_AVVISI = "avvisi"
 
 
+from dataclasses import dataclass
+
+
+@dataclass(frozen=True)
 class SyncResult:
     """Esito sintetico per la UI."""
-    def __init__(self, ok: bool, message: str = ""):
-        self.ok = ok
-        self.message = message
+    ok: bool
+    message: str = ""
 
-    def __bool__(self):
+    def __bool__(self) -> bool:
         return self.ok
 
 
@@ -45,91 +47,86 @@ def _upsert_aziende(engine: Engine, items: list) -> None:
     if not items:
         return
     with engine.begin() as conn:
-        for it in items:
-            conn.execute(text("""
-                INSERT INTO aziende (id, nome) VALUES (:id, :nome)
-                ON CONFLICT(id) DO UPDATE SET nome=excluded.nome
-            """), it)
+        conn.execute(text("""
+            INSERT INTO aziende (id, nome) VALUES (:id, :nome)
+            ON CONFLICT(id) DO UPDATE SET nome=excluded.nome
+        """), items)
 
 
 def _upsert_agri(engine: Engine, items: list) -> None:
     if not items:
         return
     with engine.begin() as conn:
-        for it in items:
-            conn.execute(text("""
-                INSERT INTO agri (id, azienda_id, nome) VALUES (:id, :azienda_id, :nome)
-                ON CONFLICT(id) DO UPDATE SET
-                    azienda_id=excluded.azienda_id, nome=excluded.nome
-            """), it)
+        conn.execute(text("""
+            INSERT INTO agri (id, azienda_id, nome) VALUES (:id, :azienda_id, :nome)
+            ON CONFLICT(id) DO UPDATE SET
+                azienda_id=excluded.azienda_id, nome=excluded.nome
+        """), items)
 
 
 def _upsert_contrade(engine: Engine, items: list) -> None:
     if not items:
         return
     with engine.begin() as conn:
-        for it in items:
-            conn.execute(text("""
-                INSERT INTO contrade (id, agro_id, nome) VALUES (:id, :agro_id, :nome)
-                ON CONFLICT(id) DO UPDATE SET
-                    agro_id=excluded.agro_id, nome=excluded.nome
-            """), it)
+        conn.execute(text("""
+            INSERT INTO contrade (id, agro_id, nome) VALUES (:id, :agro_id, :nome)
+            ON CONFLICT(id) DO UPDATE SET
+                agro_id=excluded.agro_id, nome=excluded.nome
+        """), items)
 
 
 def _upsert_tendoni(engine: Engine, items: list) -> None:
     if not items:
         return
     with engine.begin() as conn:
-        for it in items:
-            conn.execute(text("""
-                INSERT INTO tendoni (id, contrada_id, codice, ettari)
-                VALUES (:id, :contrada_id, :codice, :ettari)
-                ON CONFLICT(id) DO UPDATE SET
-                    contrada_id=excluded.contrada_id,
-                    codice=excluded.codice, ettari=excluded.ettari
-            """), it)
+        conn.execute(text("""
+            INSERT INTO tendoni (id, contrada_id, codice, ettari)
+            VALUES (:id, :contrada_id, :codice, :ettari)
+            ON CONFLICT(id) DO UPDATE SET
+                contrada_id=excluded.contrada_id,
+                codice=excluded.codice, ettari=excluded.ettari
+        """), items)
 
 
 def _upsert_prodotti(engine: Engine, items: list) -> None:
     if not items:
         return
     with engine.begin() as conn:
-        for it in items:
-            # Usiamo ON CONFLICT per aggiornare i dati senza mai cancellare l'ID
-            # Questo garantisce che i trattamenti collegati non vengano toccati
-            conn.execute(text("""
-                INSERT INTO prodotti (
-                    id, nome_prodotto, categoria, numero_registrazione,
-                    sostanza_attiva, bio_convenzionale, avversita,
-                    titolo_n, titolo_p, titolo_k,
-                    phi_giorni, trattamenti_max, intervallo_min_tratt,
-                    unita_misura, min_sostanza, max_sostanza, qta_acqua, blacklist
-                ) VALUES (
-                    :id, :nome_prodotto, :categoria, :numero_registrazione,
-                    :sostanza_attiva, :bio_convenzionale, :avversita,
-                    :titolo_n, :titolo_p, :titolo_k,
-                    :phi_giorni, :trattamenti_max, :intervallo_min_tratt,
-                    :unita_misura, :min_sostanza, :max_sostanza, :qta_acqua, :blacklist
-                )
-                ON CONFLICT(id) DO UPDATE SET
-                    nome_prodotto=excluded.nome_prodotto,
-                    categoria=excluded.categoria,
-                    numero_registrazione=excluded.numero_registrazione,
-                    sostanza_attiva=excluded.sostanza_attiva,
-                    bio_convenzionale=excluded.bio_convenzionale,
-                    avversita=excluded.avversita,
-                    titolo_n=excluded.titolo_n,
-                    titolo_p=excluded.titolo_p,
-                    titolo_k=excluded.titolo_k,
-                    phi_giorni=excluded.phi_giorni,
-                    trattamenti_max=excluded.trattamenti_max,
-                    intervallo_min_tratt=excluded.intervallo_min_tratt,
-                    unita_misura=excluded.unita_misura,
-                    min_sostanza=excluded.min_sostanza,
-                    max_sostanza=excluded.max_sostanza,
-                    qta_acqua=excluded.qta_acqua,
-                    blacklist=excluded.blacklist
-            """), it)
+        # ON CONFLICT aggiorna senza cancellare l'ID: i trattamenti collegati
+        # non vengono toccati. SQLAlchemy esegue executemany batchando.
+        conn.execute(text("""
+            INSERT INTO prodotti (
+                id, nome_prodotto, categoria, numero_registrazione,
+                sostanza_attiva, bio_convenzionale, avversita,
+                titolo_n, titolo_p, titolo_k,
+                phi_giorni, trattamenti_max, intervallo_min_tratt,
+                unita_misura, min_sostanza, max_sostanza, qta_acqua, blacklist
+            ) VALUES (
+                :id, :nome_prodotto, :categoria, :numero_registrazione,
+                :sostanza_attiva, :bio_convenzionale, :avversita,
+                :titolo_n, :titolo_p, :titolo_k,
+                :phi_giorni, :trattamenti_max, :intervallo_min_tratt,
+                :unita_misura, :min_sostanza, :max_sostanza, :qta_acqua, :blacklist
+            )
+            ON CONFLICT(id) DO UPDATE SET
+                nome_prodotto=excluded.nome_prodotto,
+                categoria=excluded.categoria,
+                numero_registrazione=excluded.numero_registrazione,
+                sostanza_attiva=excluded.sostanza_attiva,
+                bio_convenzionale=excluded.bio_convenzionale,
+                avversita=excluded.avversita,
+                titolo_n=excluded.titolo_n,
+                titolo_p=excluded.titolo_p,
+                titolo_k=excluded.titolo_k,
+                phi_giorni=excluded.phi_giorni,
+                trattamenti_max=excluded.trattamenti_max,
+                intervallo_min_tratt=excluded.intervallo_min_tratt,
+                unita_misura=excluded.unita_misura,
+                min_sostanza=excluded.min_sostanza,
+                max_sostanza=excluded.max_sostanza,
+                qta_acqua=excluded.qta_acqua,
+                blacklist=excluded.blacklist
+        """), items)
 
 
 def _upsert_trattamenti(engine: Engine, items: list) -> None:
@@ -195,21 +192,25 @@ def _upsert_trattamenti(engine: Engine, items: list) -> None:
                     conn.execute(text(
                         "DELETE FROM dettaglio_trattamenti WHERE trattamento_id = :tid"
                     ), {"tid": tid})
-                    for d in t.get("dettagli", []):
+                    dettagli = t.get("dettagli") or []
+                    if dettagli:
                         conn.execute(text("""
                             INSERT INTO dettaglio_trattamenti
                                 (trattamento_id, tendone_id, quantita_sostanza, botti, dose_ha, is_bilanciamento)
                             VALUES (:tid, :tendone_id, :quantita_sostanza, :botti, :dose_ha, :is_bilanciamento)
-                        """), {
-                            "tid": tid,
-                            "tendone_id": d.get("tendone_id"),
-                            "quantita_sostanza": d.get("quantita_sostanza", 0),
-                            "botti": d.get("botti"),
-                            "dose_ha": d.get("dose_ha"),
-                            "is_bilanciamento": d.get("is_bilanciamento", 0),
-                        })
+                        """), [
+                            {
+                                "tid": tid,
+                                "tendone_id": d.get("tendone_id"),
+                                "quantita_sostanza": d.get("quantita_sostanza", 0),
+                                "botti": d.get("botti"),
+                                "dose_ha": d.get("dose_ha"),
+                                "is_bilanciamento": d.get("is_bilanciamento", 0),
+                            }
+                            for d in dettagli
+                        ])
             except IntegrityError as e:
-                log.warning("Scartato Trattamento corrotto dal server (ID %s)", tid)
+                log.warning("Scartato Trattamento corrotto dal server (ID %s): %s", tid, e)
 
 
 def _upsert_movimenti(engine: Engine, items: list) -> None:
@@ -223,18 +224,33 @@ def _upsert_movimenti(engine: Engine, items: list) -> None:
     if not items:
         return
 
+    # UPSERT via ON CONFLICT(id): evita il vecchio DELETE+INSERT (due statement).
+    # Manteniamo il savepoint per-record per scartare singoli record corrotti
+    # senza far cadere l'intero lotto (es. FK verso un trattamento non ancora
+    # arrivato).
+    upsert_sql = text("""
+        INSERT INTO registro_magazzino
+            (id, prodotto_id, trattamento_id, azienda_id, azienda_id_origine,
+             data_movimento, tipo_movimento, quantita, n_ddt, fornitore, note)
+        VALUES (:id, :prodotto_id, :trattamento_id, :azienda_id, :azienda_id_origine,
+             :data_movimento, :tipo_movimento, :quantita, :n_ddt, :fornitore, :note)
+        ON CONFLICT(id) DO UPDATE SET
+            prodotto_id=excluded.prodotto_id,
+            trattamento_id=excluded.trattamento_id,
+            azienda_id=excluded.azienda_id,
+            azienda_id_origine=excluded.azienda_id_origine,
+            data_movimento=excluded.data_movimento,
+            tipo_movimento=excluded.tipo_movimento,
+            quantita=excluded.quantita,
+            n_ddt=excluded.n_ddt,
+            fornitore=excluded.fornitore,
+            note=excluded.note
+    """)
     with engine.begin() as conn:
         for m in items:
             try:
                 with conn.begin_nested():
-                    conn.execute(text("DELETE FROM registro_magazzino WHERE id = :id"), {"id": m["id"]})
-                    conn.execute(text("""
-                        INSERT INTO registro_magazzino
-                            (id, prodotto_id, trattamento_id, azienda_id, azienda_id_origine,
-                             data_movimento, tipo_movimento, quantita, n_ddt, fornitore, note)
-                        VALUES (:id, :prodotto_id, :trattamento_id, :azienda_id, :azienda_id_origine,
-                             :data_movimento, :tipo_movimento, :quantita, :n_ddt, :fornitore, :note)
-                    """), {
+                    conn.execute(upsert_sql, {
                         "id": m["id"],
                         "prodotto_id": m.get("prodotto_id"),
                         "trattamento_id": m.get("trattamento_id"),
@@ -248,7 +264,7 @@ def _upsert_movimenti(engine: Engine, items: list) -> None:
                         "note": m.get("note"),
                     })
             except IntegrityError as e:
-                log.warning("Scartato Movimento corrotto dal server (ID %s)", m.get('id'))
+                log.warning("Scartato Movimento corrotto dal server (ID %s): %s", m.get('id'), e)
 
 
 def _replace_avvisi(engine: Engine, items: list) -> None:
@@ -281,27 +297,40 @@ def _replace_avvisi(engine: Engine, items: list) -> None:
 def _delete_ids(engine: Engine, table: str, ids: list) -> None:
     if not ids:
         return
+    # int() coercion protegge da SQL injection sui valori; la table arriva da
+    # callsite hard-coded. Una sola DELETE batchata invece di N statement.
+    ids_list = ",".join(str(int(i)) for i in ids)
     with engine.begin() as conn:
-        for i in ids:
-            conn.execute(text(f"DELETE FROM {table} WHERE id = :id"), {"id": i})
-
-
-# Mapping entity_type → tabella locale, centralizzato in pending_types
-from pending_types import ENTITY_TO_TABLE as _ENTITY_TO_TABLE  # noqa: E402
+        conn.execute(text(f"DELETE FROM {table} WHERE id IN ({ids_list})"))
 
 
 def _protected_ids_for(engine: Engine, entity_type: str) -> set:
-    """Ritorna gli ID con qualsiasi pending op (INSERT/UPDATE/DELETE/AUTORIZZA/REVOCA).
+    """Ritorna gli ID con qualsiasi pending op per la singola entity_type.
 
-    Questi ID rappresentano scritture locali non ancora propagate al server e
-    NON devono essere toccati durante reconcile (né upsert né delete), per
-    evitare di sovrascrivere/cancellare modifiche utente non ancora caricate.
-    """
+    Convenienza per i callsite che lavorano su una sola entità (es. pull
+    incrementale). Per reconcile, che le scorre tutte, usare invece
+    `_all_protected_ids` (una sola query)."""
     with engine.connect() as conn:
         rows = conn.execute(text(
             "SELECT entity_id FROM pending_operations WHERE entity_type = :e"
         ), {"e": entity_type}).fetchall()
     return {r[0] for r in rows if r[0] is not None}
+
+
+def _all_protected_ids(engine: Engine) -> dict:
+    """Ritorna un dict entity_type → set[entity_id] con tutte le pending op.
+
+    Una sola query invece di N per entità: usato dal reconcile completo che
+    altrimenti farebbe 7 SELECT consecutivi su pending_operations."""
+    with engine.connect() as conn:
+        rows = conn.execute(text(
+            "SELECT entity_type, entity_id FROM pending_operations "
+            "WHERE entity_id IS NOT NULL"
+        )).fetchall()
+    by_entity: dict = {}
+    for et, eid in rows:
+        by_entity.setdefault(et, set()).add(eid)
+    return by_entity
 
 
 def _reconcile_entity(engine: Engine, table: str, entity_type: str,
@@ -356,6 +385,11 @@ def reconcile_with_server(api: ApiClient, engine: Engine, notifier=None) -> Sync
     rimossi_totali = 0
     set_downloading(engine, True)
     try:
+        # Pre-carica in un'unica query tutte le pending op (raggruppate per
+        # entity_type). Senza, ogni iterazione faceva un SELECT su
+        # pending_operations: 7 query consecutive identiche.
+        protected_by_entity = _all_protected_ids(engine)
+
         # Per ogni entità: scarica lo stato corrente completo (since=None),
         # upserta gli items e cancella i fantasmi.
         for fetcher, upserter, table, entity_type in [
@@ -370,10 +404,9 @@ def reconcile_with_server(api: ApiClient, engine: Engine, notifier=None) -> Sync
             resp = fetcher(None)
             items = resp.get("items", [])
 
-            # Calcola gli ID con pending op: non vanno toccati né dall'upsert
-            # né dal phantom-delete. Preserva scritture locali non ancora
-            # propagate al server (vedi bug C1).
-            protected = _protected_ids_for(engine, entity_type)
+            # ID con pending op: non vanno toccati né dall'upsert né dal
+            # phantom-delete. Preserva scritture locali non ancora propagate.
+            protected = protected_by_entity.get(entity_type, set())
             safe_items = [it for it in items if it.get("id") not in protected]
             upserter(engine, safe_items)
 

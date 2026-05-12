@@ -1,6 +1,10 @@
 from datetime import datetime
 from sqlalchemy import text
 
+from app_logging import get_logger
+
+log = get_logger(__name__)
+
 def ricalcola_avvisi_globali(engine_or_conn):
     """
     Versione modificata per accettare sia l'engine che una connessione esistente.
@@ -137,14 +141,16 @@ def _esegui_logica_avvisi(conn):
                     testo_msg = f"⚠️ Tendone {codice}: Intervallo minimo violato ({giorni_passati} gg su {intervallo} richiesti per «{prodotto}»)."
                     avvisi_per_trattamento.setdefault(t_id, []).append(testo_msg)
 
-        # 4. Scrittura finale nel Database
-        for t_id, avvisi in avvisi_per_trattamento.items():
-            avvisi_unici = list(dict.fromkeys(avvisi))
-            testo_completo = "\n".join(avvisi_unici)
+        # 4. Scrittura finale nel Database (batchata in una sola executemany)
+        payloads = [
+            {"id": t_id, "t": "\n".join(dict.fromkeys(avvisi))}
+            for t_id, avvisi in avvisi_per_trattamento.items()
+        ]
+        if payloads:
             conn.execute(
                 text("INSERT INTO avvisi_trattamenti (trattamento_id, testo) VALUES (:id, :t)"),
-                {"id": t_id, "t": testo_completo},
+                payloads,
             )
 
     except Exception as e:
-        print("Errore durante il ricalcolo degli avvisi:", e)
+        log.warning("Errore durante il ricalcolo degli avvisi: %s", e)

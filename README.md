@@ -1,39 +1,57 @@
-# AgriMessina QDC — Desktop (versione client REST)
+# AgriMessina QDC — Desktop
 
-App desktop migrata da accesso diretto a MySQL → **client REST puro** verso il backend FastAPI.
+Client desktop per la gestione trattamenti e magazzino fitosanitari. PyQt6 +
+SQLite locale + REST client verso il backend FastAPI.
+
+---
 
 ## Architettura
 
 ```
-┌─────────────────────┐    HTTPS    ┌──────────────────┐    SQL    ┌──────────┐
-│  App Desktop        │ ──REST───►  │  Backend API     │ ─pymysql─►│  MySQL   │
-│  (PyQt6 + SQLite)   │             │  (FastAPI)       │           │   DB     │
-└─────────────────────┘             └──────────────────┘           └──────────┘
-       ▲                                     │
-       │  ●   ●   ●   ●                      │
-       └────────────────────── sync incrementale ─┘
-       SQLite locale per offline-first
+┌────────────────────┐                         ┌──────────────────────┐
+│  Desktop (PyQt6)   │  ───── HTTPS REST ────► │  Backend (FastAPI)   │
+│                    │                         │                      │
+│  SQLite locale     │  ◄──── SSE push ─────── │   MySQL              │
+│  (cache offline)   │                         │                      │
+└────────────────────┘                         └──────────────────────┘
 ```
 
-L'app **non parla mai direttamente con MySQL**. Tutte le scritture passano per
-il backend; il SQLite locale è una cache per le letture veloci e il funzionamento
-offline.
+Il desktop **non parla mai direttamente con MySQL**. Tutte le scritture
+passano per il backend; il SQLite locale è una cache per letture veloci e
+operatività offline.
 
-## Setup
+### Principi
+
+- **Server-authoritative**: la logica di business critica (scarichi magazzino,
+  alias warehouse, tombstone tracking) gira sul backend. Tutti i client la
+  consumano in sola lettura via `/magazzino/movimenti`.
+- **Offline-first**: scritture locali vengono accodate in `pending_operations`
+  e inviate quando c'è rete. UI sempre reattiva, sync in background.
+- **SSE push real-time**: l'app mantiene una connessione a `/events`.
+  Quando un altro client (es. app Android di un operatore in campo) crea
+  un trattamento, il desktop lo vede entro 1-2 secondi. I timer di polling
+  ci sono ma fungono solo da fallback offline.
+
+---
+
+## Setup sviluppo
 
 ### Requisiti
 ```bash
-pip install PyQt6 SQLAlchemy httpx python-dotenv
+python3 -m venv venv
+source venv/bin/activate    # Linux/macOS
+# venv\Scripts\activate     # Windows
+pip install -r requirements.txt
 ```
 
 ### Configurazione
-Crea un file `.env` nella stessa cartella di `main.py`:
-```
+Il file `.env` (committato, contiene solo URL pubblico) imposta:
+```env
 API_BASE_URL=https://api.agrimessina.it
 ```
 
-Per testing in locale puoi puntare al backend locale:
-```
+Per testing su backend locale:
+```env
 API_BASE_URL=http://127.0.0.1:8000
 ```
 
@@ -42,91 +60,158 @@ API_BASE_URL=http://127.0.0.1:8000
 python main.py
 ```
 
-Al primo avvio:
-1. Splash
-2. Login (richiede email + password — ATTENZIONE: il backend autentica per **email**, non username)
-3. Sync iniziale (download di tutto)
-4. Finestra principale
+Primo avvio: splash → login → sync iniziale → finestra principale.
+Successivi avvii: il token JWT salvato in `~/.agrimessina/auth.json` permette
+l'auto-login. Quando scade, l'app intercetta il 401 e mostra il dialog di
+re-login automaticamente.
 
-Ai successivi avvii il token è già salvato in `~/.agrimessina/auth.json`, quindi l'app entra direttamente.
-
-### File creati a runtime
-- `~/.agrimessina/auth.json` → token JWT + ruolo
-- `~/.agrimessina/local.db` → SQLite cache
-- `~/.agrimessina/` → cartella di config
-
-## Come funziona la sync
-
-### Letture
-Tutto avviene da `~/.agrimessina/local.db`. È un mirror dello schema MySQL del backend, popolato automaticamente al login e ad ogni "Sincronizza".
-
-### Scritture
-Le UI esistenti (`ui_anagrafiche.py`, `ui_magazzino.py`, ecc.) **scrivono direttamente al SQLite** con SQL grezzo, **senza modifiche**. È la stessa cosa che facevano prima quando puntavano a MySQL: stesso schema, stesso codice.
-
-Cosa cambia rispetto a prima: dei **trigger SQLite** (definiti in `local_db.py`) intercettano ogni `INSERT/UPDATE/DELETE` su `aziende`, `agri`, `contrade`, `tendoni`, `prodotti`, `registro_magazzino` e accodano l'operazione nella tabella `pending_operations`.
-
-Al successivo "Sincronizza" o riavvio:
-1. `pending_uploader.py` legge la coda e chiama l'API per ogni operazione
-2. `sync.py` scarica i nuovi dati dal server
-3. La UI viene rinfrescata
-
-### ID server-generated
-Quando crei un'azienda nuova, il SQLite locale le assegna un id `42`, ma il server al `POST /aziende` le darà l'id reale `17`. Per riallineare, dopo ogni upload con INSERT l'app forza un `reset_sync_state` + sync completa. Questo non è ottimale per la rete (ridownload tutto), ma è semplice e robusto.
-
-## Trattamenti — gestione speciale
-
-I trattamenti sono diversi: hanno relazione testata-dettagli, e l'API li accetta come unico oggetto JSON con `dettagli` array. Per questo NON ci sono trigger SQLite su `trattamenti`/`dettaglio_trattamenti`.
-
-**Già implementato**: `ui_trattamenti.py` chiama `enqueue_operation()` nei 5 punti di scrittura:
-
-| Funzione | Operazione accodata |
-|---|---|
-| Salvataggio nuovo trattamento (`DialogNuovoTrattamento.salva`) | `INSERT` con tutti i dettagli |
-| Compensa disavanzo (`DialogCompensaDisavanzo.salva`) | `UPDATE` trattamento origine + `INSERT/UPDATE` trattamento destinazione |
-| Eliminazione singola | `DELETE` per trattamento + `DELETE` per ogni figlio bilanciamento |
-| Eliminazione multipla | `DELETE` per ogni trattamento selezionato + figli |
-| Annulla bilanciamento (`_annulla_bilanciamento`) | `UPDATE` per ogni trattamento toccato (con i dettagli di bilanciamento rimossi) |
-
-La helper `_build_trattamento_payload(engine, trattamento_id)` (nelle prime righe del file) costruisce il payload JSON completo nel formato atteso dall'API leggendo testata + dettagli dal SQLite locale.
-
-## File del progetto
-
-```
-agrimessina_desktop/
-├── main.py                  ← NUOVO: entry point con login dialog
-├── api_client.py            ← NUOVO: wrapper httpx, gestione token, decode JWT
-├── local_db.py              ← NUOVO: SQLite locale + trigger di accodamento
-├── sync.py                  ← NUOVO: sync incrementale via since=server_time
-├── pending_uploader.py      ← NUOVO: upload delle modifiche locali
-├── login_dialog.py          ← NUOVO: finestra di login PyQt6 (con QThread)
-│
-├── ui_core.py               ← invariato (tuo codice esistente)
-├── ui_anagrafiche.py        ← invariato (tuo codice esistente)
-├── ui_magazzino.py          ← invariato (tuo codice esistente)
-└── ui_trattamenti.py        ← invariato (tuo codice esistente, ma vedi sezione "Trattamenti")
-```
-
-I file vecchi `database.py` (init MySQL) e il vecchio `main.py` (con engine MySQL) **non servono più**: il nuovo `main.py` li sostituisce e `local_db.py` rimpiazza `database.py`.
-
-## Limiti conosciuti / TODO
-
-1. **Avvisi** (`ricalcola_avvisi_globali` del vecchio `database.py`) non sono più automatici. La logica è complessa e specifica del SQL MySQL. O la porti sul backend (preferibile, così tutti i client la vedono uguale), o la riadatti per SQLite locale chiamandola dopo `sync_all`.
-2. **Trattamenti** — vedi sezione sopra.
-3. **Conflict resolution** — se due dispositivi modificano lo stesso record, vince l'ultimo che chiama il server (last-write-wins). Per il tuo caso d'uso è sufficiente.
-4. **Nessun re-login automatico** quando il token JWT scade. L'app mostra un errore e l'utente deve riavviare.
-
-## Risoluzione problemi
-
-**"Impossibile contattare il server"**:
-- Verifica `API_BASE_URL` nel `.env`
-- Prova a curl-are il backend: `curl https://api.agrimessina.it/health`
-
-**"Credenziali non valide"**:
-- Il backend cerca per **email**, non per username
-- Verifica con il backend admin che l'utente esista nella tabella `users`
-
-**Reset completo dei dati locali**:
+### Reset dati locali
 ```bash
 rm -rf ~/.agrimessina
 ```
-Al prossimo avvio sarà come una prima installazione.
+
+---
+
+## Flusso scritture
+
+```
+[UI] → INSERT/UPDATE/DELETE locale su SQLite
+        │
+        ├─ trigger SQLite → riga in pending_operations
+        │
+        ├─ enqueue_operation() esplicito per trattamenti (UI sa serializzare)
+        │
+        ▼
+[pending_uploader] (ogni 3 s) → POST/PUT/DELETE all'API
+        │
+        ▼
+[Backend] applica + emette evento SSE
+        │
+        ▼
+[Tutti i client connessi] ricevono "trattamenti_changed" / "magazzino_changed"
+        │
+        ▼
+[Desktop] pull_trattamenti → upsert SQLite → UI si aggiorna
+```
+
+### Magazzino: solo il server calcola
+
+Gli auto-scarichi (`SCARICO` con `trattamento_id` valorizzato) sono **sempre**
+calcolati server-side da `app/magazzino_calculator.sincronizza_scarico`.
+Il desktop li legge in sola lettura via `/magazzino/movimenti`. Il pulsante
+"🔧 Ricalcola scarichi" sui pannelli magazzino delega a `POST /magazzino/ricalcola`.
+
+I CARICHI manuali (con `trattamento_id` NULL) restano gestiti dalla UI desktop.
+
+---
+
+## Build & release (CI Windows)
+
+Tutto via GitHub Actions `.github/workflows/build-windows.yml`.
+
+### Fare una release
+```bash
+git tag v1.2.3
+git push origin v1.2.3
+```
+
+Il workflow:
+1. Inietta la versione in `_version.py`
+2. PyInstaller `--onedir` produce `dist/AgriMessina/`
+3. Inno Setup impacchetta in `installer/output/AgriMessina_Setup_1.2.3.exe`
+4. Pubblica come **GitHub Release** con installer allegato
+
+Gli utenti finali aprono l'app: l'`update_checker.py` controlla `releases/latest`
+all'avvio e mostra un dialog non invasivo se c'è una versione più recente.
+
+### Test manuale del workflow
+GitHub Actions → "Build Windows Installer" → Run workflow → versione di prova.
+Genera artifact CI di durata 7 giorni (non release).
+
+---
+
+## Struttura del repo
+
+```
+qdc/
+├── main.py                  Entry point: splash, login, timer, listener SSE
+├── _version.py              Versione (riscritto dal CI prima del build)
+├── api_client.py            Wrapper httpx + gestione token JWT
+├── login_dialog.py          Finestra di login PyQt6
+├── update_checker.py        Controllo aggiornamenti GitHub Releases
+├── events_listener.py       Listener SSE per push real-time dal server
+│
+├── local_db.py              Schema SQLite + trigger di accodamento
+├── pending_uploader.py      Upload pending_operations al server
+├── sync.py                  Sync incrementale + reconcile + pull_trattamenti
+├── sync_notifier.py         Signal Qt per stato sync nella status bar
+├── database.py              Helper avvisi locali (legacy ma usato al boot)
+├── magazzino_logic.py       Migration helpers one-off (legacy)
+│
+├── ui_core.py               Base classes PyQt6 (PannelloBaseDialog, ecc.)
+├── ui_anagrafiche.py        CRUD aziende/agri/contrade/tendoni
+├── ui_magazzino.py          Pannelli "Magazzino <Azienda>" con prodotti/giacenze
+├── ui_trattamenti.py        Storico/Revisionati/Bilanciamenti/Dialog
+│
+├── config.py                Polling intervals + WAREHOUSE_PRIORITY/ALIASES
+├── pending_types.py         Tipi/enum per le pending_operations
+├── app_logging.py           Setup logging file/console
+├── diagnose.py              Tool diagnostico standalone
+│
+├── AgriMessina.spec         PyInstaller spec
+├── installer/AgriMessina.iss Inno Setup script
+├── codemagic.yaml           CI alternativo (non attivo)
+├── .github/workflows/       GitHub Actions workflows
+│
+├── icona.ico, splash.png    Risorse grafiche
+├── requirements.txt         Dipendenze Python
+└── LICENSE                  Proprietaria, "All rights reserved"
+```
+
+---
+
+## Configurazione CI
+
+Le variabili (`autosync_ms`, ecc.) in `config.py` sono override-abili via env
+con prefisso `QDC_`:
+
+```bash
+QDC_AUTOSYNC_MS=10000 python main.py   # polling upload ogni 10 s invece di 3
+```
+
+Vedi `config.py` per la lista completa.
+
+---
+
+## Troubleshooting
+
+**"Sessione scaduta" in loop** → il backend ha rigenerato il `JWT_SECRET`
+o l'utente è stato cancellato. Il client mostra il dialog di re-login; basta
+fare login con credenziali valide.
+
+**"Impossibile contattare il server"** → verifica `.env` + curl il backend:
+```bash
+curl https://api.agrimessina.it/health
+```
+
+**Stato SSE "Polling" in status bar** → SSE non si connette. Possibili cause:
+proxy/firewall che blocca le connessioni keep-alive, oppure backend offline.
+L'app continua a funzionare via polling fallback (3s upload, 30min reconcile),
+solo gli update da altri client tardano qualche minuto.
+
+**Stati incoerenti del magazzino dopo bug noti** → click "🔧 Ricalcola scarichi"
+sul pannello magazzino. Triggera `POST /magazzino/ricalcola` server-side e
+ri-pulla la lista completa col phantom-delete.
+
+---
+
+## Test backend
+
+Il backend (`app/`) ha pytest in `app/tests/`:
+```bash
+cd ../  # root del progetto, dove c'è pytest.ini
+pytest app/tests -v
+```
+
+Il workflow CI `.github/workflows/test-backend.yml` esegue questi test su
+ogni push/PR che tocca `app/`.

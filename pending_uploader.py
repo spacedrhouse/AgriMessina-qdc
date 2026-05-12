@@ -1,15 +1,18 @@
 """Uploader della coda offline con logica di ID Swap (Estrazione Robusta)."""
 from __future__ import annotations
 import json
-from typing import List
+from typing import Any, List, Optional
 from sqlalchemy import text
 from sqlalchemy.engine import Engine
 from api_client import ApiClient, ApiError, NetworkError, NotAuthenticatedError
 from app_logging import get_logger
-from pending_types import EntityType, OpType, ENTITY_TO_TABLE
+from pending_types import ENTITY_TO_TABLE
 from config import CONFIG
 
 log = get_logger(__name__)
+
+
+# ---- Helper di basso livello ------------------------------------------------
 
 def _payload_summary(entity_type: str, payload: dict) -> str:
     """Riassunto leggibile del payload per messaggi all'utente."""
@@ -53,9 +56,230 @@ def _move_to_dead_letter(engine: Engine, op: dict, error: str, notifier=None) ->
             f"fallita {op.get('retry_count', 0) + 1} volte: spostata in dead-letter"
         )
 
+
 def _delete_op(engine: Engine, op_id: int) -> None:
     with engine.begin() as conn:
         conn.execute(text("DELETE FROM pending_operations WHERE id = :id"), {"id": op_id})
+
+
+def _extract_new_id(resp: Any) -> Optional[int]:
+    """Estrae l'ID assegnato dal server dalla risposta del create_*.
+    Accetta dict, Response, o oggetto con attributo `.id`."""
+    if isinstance(resp, dict):
+        return resp.get("id")
+    if hasattr(resp, "json") and callable(getattr(resp, "json")):
+        try:
+            return resp.json().get("id")
+        except Exception:
+            return None
+    if hasattr(resp, "id"):
+        return getattr(resp, "id")
+    return None
+
+
+def _cleanup_local_record(conn, et: str, eid) -> None:
+    """Rimuove un record locale e le sue dipendenze (dettagli, avvisi, registro).
+    Da chiamare DENTRO una transazione con _sync_flags.downloading=1 già attivo."""
+    if et == "TRATTAMENTO":
+        conn.execute(text("DELETE FROM dettaglio_trattamenti WHERE trattamento_id = :id"), {"id": eid})
+        conn.execute(text("DELETE FROM avvisi_trattamenti WHERE trattamento_id = :id"), {"id": eid})
+        conn.execute(text("DELETE FROM registro_magazzino WHERE trattamento_id = :id"), {"id": eid})
+    table = ENTITY_TO_TABLE.get(et)
+    if table:
+        conn.execute(text(f"DELETE FROM {table} WHERE id = :id"), {"id": eid})
+
+
+def _delete_record_with_flag(engine: Engine, et: str, eid) -> None:
+    """Cancella localmente un record e i suoi figli, sopprimendo i trigger di enqueue."""
+    table = ENTITY_TO_TABLE.get(et)
+    if not table:
+        return
+    with engine.begin() as conn:
+        conn.execute(text("UPDATE _sync_flags SET value = 1 WHERE key = 'downloading'"))
+        _cleanup_local_record(conn, et, eid)
+        conn.execute(text("UPDATE _sync_flags SET value = 0 WHERE key = 'downloading'"))
+
+
+# ---- Dispatch API -----------------------------------------------------------
+
+def _call_api(api: ApiClient, engine: Engine, op: dict, payload: dict):
+    """Esegue la chiamata API per (entity_type, operation_type). Ritorna `resp`
+    (None per operazioni che non producono ID, dict/oggetto per INSERT)."""
+    et, ot, eid = op["entity_type"], op["operation_type"], op["entity_id"]
+
+    if et == "AZIENDA":
+        if ot == "INSERT": return api.create_azienda(payload.get("nome"))
+        if ot == "UPDATE": api.update_azienda(eid, payload.get("nome")); return None
+        if ot == "DELETE": api.delete_azienda(eid); return None
+    elif et == "AGRO":
+        if ot == "INSERT": return api.create_agro(payload.get("azienda_id"), payload.get("nome"))
+        if ot == "UPDATE": api.update_agro(eid, payload.get("azienda_id"), payload.get("nome")); return None
+        if ot == "DELETE": api.delete_agro(eid); return None
+    elif et == "CONTRADA":
+        if ot == "INSERT": return api.create_contrada(payload.get("agro_id"), payload.get("nome"))
+        if ot == "UPDATE": api.update_contrada(eid, payload.get("agro_id"), payload.get("nome")); return None
+        if ot == "DELETE": api.delete_contrada(eid); return None
+    elif et == "TENDONE":
+        if ot == "INSERT": return api.create_tendone(payload.get("contrada_id"), payload.get("codice"), payload.get("ettari"))
+        if ot == "UPDATE": api.update_tendone(eid, payload.get("contrada_id"), payload.get("codice"), payload.get("ettari")); return None
+        if ot == "DELETE": api.delete_tendone(eid); return None
+    elif et == "PRODOTTO":
+        if ot == "INSERT": return api.create_prodotto(payload)
+        if ot == "UPDATE": api.update_prodotto(eid, payload); return None
+        if ot == "DELETE": api.delete_prodotto(eid); return None
+    elif et == "TRATTAMENTO":
+        if ot == "INSERT":
+            return api.create_trattamento(payload)
+        if ot == "UPDATE":
+            # Re-leggi is_autorizzato dal DB locale: se reconcile ha portato giù
+            # un valore aggiornato dal server (es. mobile ha autorizzato), non
+            # vogliamo sovrascriverlo col vecchio (backend è PUT-replace).
+            with engine.connect() as conn:
+                is_aut = conn.execute(text(
+                    "SELECT is_autorizzato FROM trattamenti WHERE id = :id"
+                ), {"id": eid}).scalar()
+            if is_aut is not None:
+                payload["is_autorizzato"] = int(is_aut)
+            api.update_trattamento(eid, payload)
+            return None
+        if ot == "DELETE": api.delete_trattamento(eid); return None
+        if ot == "AUTORIZZA": api.autorizza_trattamento(eid); return None
+        if ot == "REVOCA": api.revoca_trattamento(eid); return None
+    elif et == "MOVIMENTO":
+        if ot == "INSERT": return api.create_movimento(payload)
+        if ot == "UPDATE": api.update_movimento(eid, payload); return None
+        if ot == "DELETE": api.delete_movimento(eid); return None
+
+    return None
+
+
+# ---- ID swap ----------------------------------------------------------------
+
+def _rebind_child_fks(conn, et: str, old_id, new_id) -> None:
+    """Aggiorna le FK figlie dopo lo swap dell'ID di un padre."""
+    if et == "TRATTAMENTO":
+        conn.execute(text("UPDATE dettaglio_trattamenti SET trattamento_id = :new WHERE trattamento_id = :old"), {"new": new_id, "old": old_id})
+        conn.execute(text("UPDATE avvisi_trattamenti SET trattamento_id = :new WHERE trattamento_id = :old"), {"new": new_id, "old": old_id})
+        conn.execute(text("UPDATE registro_magazzino SET trattamento_id = :new WHERE trattamento_id = :old"), {"new": new_id, "old": old_id})
+    elif et == "CONTRADA":
+        conn.execute(text("UPDATE tendoni SET contrada_id = :new WHERE contrada_id = :old"), {"new": new_id, "old": old_id})
+
+
+def _park_conflict(conn, et: str, table: str, conflict_id, pending: List[dict]) -> None:
+    """Sposta in parcheggio (ID negativo) un record locale che occupa già il
+    nuovo ID assegnato dal server. Aggiorna anche le FK figlie e la coda."""
+    temp_id = conn.execute(text(f"SELECT MIN(id) - 1 FROM {table}")).scalar()
+    if temp_id is None or temp_id >= 0:
+        temp_id = -1
+
+    conn.execute(text(f"UPDATE {table} SET id = :temp WHERE id = :conf"), {"temp": temp_id, "conf": conflict_id})
+
+    if et == "TRATTAMENTO":
+        conn.execute(text("UPDATE dettaglio_trattamenti SET trattamento_id = :temp WHERE trattamento_id = :conf"), {"temp": temp_id, "conf": conflict_id})
+        conn.execute(text("UPDATE avvisi_trattamenti SET trattamento_id = :temp WHERE trattamento_id = :conf"), {"temp": temp_id, "conf": conflict_id})
+        conn.execute(text("UPDATE registro_magazzino SET trattamento_id = :temp WHERE trattamento_id = :conf"), {"temp": temp_id, "conf": conflict_id})
+    elif et == "CONTRADA":
+        conn.execute(text("UPDATE tendoni SET contrada_id = :temp WHERE contrada_id = :conf"), {"temp": temp_id, "conf": conflict_id})
+    elif et == "AGRO":
+        conn.execute(text("UPDATE contrade SET agro_id = :temp WHERE agro_id = :conf"), {"temp": temp_id, "conf": conflict_id})
+    elif et == "AZIENDA":
+        conn.execute(text("UPDATE agri SET azienda_id = :temp WHERE azienda_id = :conf"), {"temp": temp_id, "conf": conflict_id})
+
+    conn.execute(text("UPDATE pending_operations SET entity_id = :temp WHERE entity_type = :et AND entity_id = :conf"),
+                 {"temp": temp_id, "et": et, "conf": conflict_id})
+
+    for future_op in pending:
+        if future_op["entity_type"] == et and str(future_op["entity_id"]) == str(conflict_id):
+            future_op["entity_id"] = temp_id
+
+    log.warning("Evitata collisione: record locale spostato in parcheggio (%s → %s)", conflict_id, temp_id)
+
+
+def _apply_id_swap(engine: Engine, et: str, table: str, old_id, new_id,
+                   op_id: int, pending: List[dict]) -> None:
+    """Esegue lo swap completo dell'ID locale → ID server e cancella la pending
+    op nella STESSA transazione. La transazionalità è critica: senza, un crash
+    fra commit dello swap e DELETE della pending op causerebbe un INSERT duplicato
+    sul server al retry."""
+    with engine.begin() as conn:
+        # Defer FK al commit: UPDATE trattamenti SET id=:new altrimenti farebbe
+        # check immediato su dettaglio_trattamenti (FK senza ON UPDATE CASCADE).
+        conn.execute(text("PRAGMA defer_foreign_keys = TRUE"))
+        conn.execute(text("PRAGMA foreign_keys = ON"))
+        conn.execute(text("UPDATE _sync_flags SET value = 1 WHERE key = 'downloading'"))
+
+        conflict = conn.execute(text(f"SELECT id FROM {table} WHERE id = :new"), {"new": new_id}).scalar()
+        if conflict is not None:
+            _park_conflict(conn, et, table, conflict, pending)
+
+        # Aggiorna ID testata (slot ora libero) e FK figlie
+        conn.execute(text(f"UPDATE {table} SET id = :new WHERE id = :old"), {"new": new_id, "old": old_id})
+        _rebind_child_fks(conn, et, old_id, new_id)
+
+        if et == "TRATTAMENTO":
+            # Coerenza visiva delle note di scarico automatico
+            conn.execute(text("UPDATE registro_magazzino SET note = 'Scarico automatico T#' || :new WHERE note = 'Scarico automatico T#' || :old"),
+                         {"new": new_id, "old": old_id})
+
+        # Rimappa le pending op successive che riferivano il vecchio ID
+        conn.execute(text(
+            "UPDATE pending_operations SET entity_id = :new "
+            "WHERE entity_type = :et AND entity_id = :old"
+        ), {"new": new_id, "et": et, "old": old_id})
+
+        conn.execute(text("UPDATE _sync_flags SET value = 0 WHERE key = 'downloading'"))
+        log.info("ID swap %s: %s → %s", et, old_id, new_id)
+
+        for future_op in pending:
+            if future_op["entity_type"] == et and str(future_op["entity_id"]) == str(old_id):
+                future_op["entity_id"] = new_id
+
+        # DELETE atomico della pending op nella stessa transazione dello swap
+        conn.execute(text("DELETE FROM pending_operations WHERE id = :pid"), {"pid": op_id})
+
+
+# ---- Error handling ---------------------------------------------------------
+
+def _handle_record_gone(engine: Engine, et: str, eid, ot: str, op_id: int,
+                        notifier) -> None:
+    """Server ha risposto 404 su UPDATE/DELETE: rimuove anche dal locale."""
+    _delete_record_with_flag(engine, et, eid)
+    log.info("Fantasma rimosso localmente (record server gone): %s #%s", et, eid)
+    if notifier is not None:
+        notifier.on_record_gone(et, int(eid) if eid is not None else 0, ot)
+    _delete_op(engine, op_id)
+
+
+def _handle_insert_rejected(engine: Engine, et: str, eid, status: int,
+                            payload: dict, op_id: int, notifier) -> None:
+    """Server ha respinto un INSERT con 4xx persistente: cancella sia la
+    pending op che il record locale per evitare loop infiniti."""
+    _delete_record_with_flag(engine, et, eid)
+    log.warning("INSERT rifiutato dal server (%s): record locale %s #%s rimosso", status, et, eid)
+    if notifier is not None:
+        notifier.on_insert_rejected(et, _payload_summary(et, payload), status)
+    _delete_op(engine, op_id)
+
+
+def _handle_transient_error(engine: Engine, op: dict, error: str, status,
+                            notifier) -> None:
+    """Errori transienti (5xx, 422 random): incrementa retry_count; oltre il
+    max sposta in dead-letter."""
+    current_retry = int(op.get("retry_count", 0) or 0)
+    new_retry = current_retry + 1
+    if new_retry >= CONFIG.pending_retry_max:
+        _move_to_dead_letter(engine, op, error, notifier=notifier)
+    else:
+        log.info("Op %s in retry %d/%d (status=%s)",
+                 op['id'], new_retry, CONFIG.pending_retry_max, status)
+        with engine.begin() as conn:
+            conn.execute(text(
+                "UPDATE pending_operations SET retry_count = :rc, last_error = :err "
+                "WHERE id = :id"
+            ), {"rc": new_retry, "err": error[:500], "id": op["id"]})
+
+
+# ---- Loop principale --------------------------------------------------------
 
 def upload_pending(api: ApiClient, engine: Engine, notifier=None) -> tuple[int, int, bool]:
     if not api.is_authenticated:
@@ -65,253 +289,62 @@ def upload_pending(api: ApiClient, engine: Engine, notifier=None) -> tuple[int, 
     had_insert = False
     pending = _list_pending(engine)
 
-    table_map = ENTITY_TO_TABLE
-
     for op in pending:
         et, ot, eid = op["entity_type"], op["operation_type"], op["entity_id"]
         payload = json.loads(op["payload_json"]) if op.get("payload_json") else {}
 
         try:
-            resp = None
+            resp = _call_api(api, engine, op, payload)
 
-            # --- ESECUZIONE OPERAZIONI PER TUTTE LE ENTITÀ ---
-            if et == "AZIENDA":
-                if ot == "INSERT": resp = api.create_azienda(payload.get("nome"))
-                elif ot == "UPDATE": api.update_azienda(eid, payload.get("nome"))
-                elif ot == "DELETE": api.delete_azienda(eid)
-            elif et == "AGRO":
-                if ot == "INSERT": resp = api.create_agro(payload.get("azienda_id"), payload.get("nome"))
-                elif ot == "UPDATE": api.update_agro(eid, payload.get("azienda_id"), payload.get("nome"))
-                elif ot == "DELETE": api.delete_agro(eid)
-            elif et == "CONTRADA":
-                if ot == "INSERT": resp = api.create_contrada(payload.get("agro_id"), payload.get("nome"))
-                elif ot == "UPDATE": api.update_contrada(eid, payload.get("agro_id"), payload.get("nome"))
-                elif ot == "DELETE": api.delete_contrada(eid)
-            elif et == "TENDONE":
-                if ot == "INSERT": resp = api.create_tendone(payload.get("contrada_id"), payload.get("codice"), payload.get("ettari"))
-                elif ot == "UPDATE": api.update_tendone(eid, payload.get("contrada_id"), payload.get("codice"), payload.get("ettari"))
-                elif ot == "DELETE": api.delete_tendone(eid)
-            elif et == "PRODOTTO":
-                if ot == "INSERT": resp = api.create_prodotto(payload)
-                elif ot == "UPDATE": api.update_prodotto(eid, payload)
-                elif ot == "DELETE": api.delete_prodotto(eid)
-            elif et == "TRATTAMENTO":
-                if ot == "INSERT":
-                    resp = api.create_trattamento(payload)
-                elif ot == "UPDATE":
-                    # Bug fix C5: re-leggi is_autorizzato dal DB locale al momento
-                    # dell'upload. Se nel frattempo reconcile ha portato giù un
-                    # valore aggiornato dal server (es. mobile ha autorizzato),
-                    # rispettiamo quel valore invece di sovrascriverlo con il
-                    # vecchio. Necessario per backend PUT-replace.
-                    with engine.connect() as conn:
-                        is_aut = conn.execute(text(
-                            "SELECT is_autorizzato FROM trattamenti WHERE id = :id"
-                        ), {"id": eid}).scalar()
-                    if is_aut is not None:
-                        payload["is_autorizzato"] = int(is_aut)
-                    api.update_trattamento(eid, payload)
-                elif ot == "DELETE": api.delete_trattamento(eid)
-                elif ot == "AUTORIZZA": api.autorizza_trattamento(eid)
-                elif ot == "REVOCA": api.revoca_trattamento(eid)
-            elif et == "MOVIMENTO":
-                if ot == "INSERT": resp = api.create_movimento(payload)
-                elif ot == "UPDATE": api.update_movimento(eid, payload)
-                elif ot == "DELETE": api.delete_movimento(eid)
-
-            # === LOGICA DI ID SWAP ROBUSTA ===
+            pending_op_deleted = False
             if ot == "INSERT":
                 had_insert = True
-                new_id = None
-
-                # 1. Tentiamo di estrarre l'ID in vari formati
-                if isinstance(resp, dict):
-                    new_id = resp.get("id")
-                elif hasattr(resp, "json") and callable(resp.json): # Oggetto Response di requests
-                    try:
-                        new_id = resp.json().get("id")
-                    except Exception:
-                        pass
-                elif hasattr(resp, "id"): # Modello Pydantic o custom
-                    new_id = getattr(resp, "id")
-
-                # 2. Applichiamo lo Swap se abbiamo trovato l'ID
-                table = table_map.get(et)
-                if new_id is not None:
-                    # Confronto come stringhe per bypassare differenze int/str
-                    if str(new_id) != str(eid) and table:
-                        with engine.begin() as conn:
-                            # Differisci i controlli FK al commit della transazione.
-                            # Necessario perché UPDATE trattamenti SET id=:new fa
-                            # un check immediato su dettaglio_trattamenti (FK
-                            # senza ON UPDATE CASCADE), che fallirebbe. Con
-                            # defer_foreign_keys=TRUE, il check avviene al COMMIT,
-                            # quando abbiamo già propagato gli aggiornamenti su
-                            # tutti i figli (dettaglio_trattamenti, avvisi, ecc).
-                            conn.execute(text("PRAGMA defer_foreign_keys = TRUE"))
-                            conn.execute(text("PRAGMA foreign_keys = ON"))
-
-                            # Disabilita i trigger (già presente)
-                            conn.execute(text("UPDATE _sync_flags SET value = 1 WHERE key = 'downloading'"))
-
-                            # --- INIZIO FIX COLLISIONE ---
-                            # Controlla se il nuovo ID è già occupato da un altro record locale in attesa
-                            conflitto = conn.execute(text(f"SELECT id FROM {table} WHERE id = :new"), {"new": new_id}).scalar()
-                            if conflitto is not None:
-                                # Trova un ID negativo per "parcheggiare" temporaneamente il record che intralcia
-                                temp_id = conn.execute(text(f"SELECT MIN(id) - 1 FROM {table}")).scalar()
-                                if temp_id is None or temp_id >= 0: temp_id = -1
-
-                                # Sposta il record intralciante in parcheggio
-                                conn.execute(text(f"UPDATE {table} SET id = :temp WHERE id = :conf"), {"temp": temp_id, "conf": conflitto})
-
-                                # Aggiorna le Foreign Key figlie (se applicabile)
-                                if et == "TRATTAMENTO":
-                                    conn.execute(text("UPDATE dettaglio_trattamenti SET trattamento_id = :new WHERE trattamento_id = :old"), {"new": new_id, "old": eid})
-                                    conn.execute(text("UPDATE avvisi_trattamenti SET trattamento_id = :new WHERE trattamento_id = :old"), {"new": new_id, "old": eid})
-                                    # Questa riga è fondamentale se avviene una collisione:
-                                    conn.execute(text("UPDATE registro_magazzino SET trattamento_id = :new WHERE trattamento_id = :old"), {"new": new_id, "old": eid})
-                                elif et == "CONTRADA":
-                                    conn.execute(text("UPDATE tendoni SET contrada_id = :temp WHERE contrada_id = :conf"), {"temp": temp_id, "conf": conflitto})
-                                elif et == "AGRO":
-                                    conn.execute(text("UPDATE contrade SET agro_id = :temp WHERE agro_id = :conf"), {"temp": temp_id, "conf": conflitto})
-                                elif et == "AZIENDA":
-                                    conn.execute(text("UPDATE agri SET azienda_id = :temp WHERE azienda_id = :conf"), {"temp": temp_id, "conf": conflitto})
-
-                                # Aggiorna la coda del database
-                                conn.execute(text("UPDATE pending_operations SET entity_id = :temp WHERE entity_type = :et AND entity_id = :conf"), {"temp": temp_id, "et": et, "conf": conflitto})
-
-                                # Aggiorna la coda in memoria
-                                for future_op in pending:
-                                    if future_op["entity_type"] == et and str(future_op["entity_id"]) == str(conflitto):
-                                        future_op["entity_id"] = temp_id
-
-                                log.warning("Evitata collisione: record locale spostato in parcheggio (%s → %s)", conflitto, temp_id)
-                            # --- FINE FIX COLLISIONE ---
-
-                            # Aggiorna ID testata (ora lo slot è sicuramente libero!)
-                            conn.execute(text(f"UPDATE {table} SET id = :new WHERE id = :old"), {"new": new_id, "old": eid})
-
-                            # Aggiorna figli (Trattamenti)
-                            if et == "TRATTAMENTO":
-                                conn.execute(text("UPDATE dettaglio_trattamenti SET trattamento_id = :new WHERE trattamento_id = :old"), {"new": new_id, "old": eid})
-                                conn.execute(text("UPDATE avvisi_trattamenti SET trattamento_id = :new WHERE trattamento_id = :old"), {"new": new_id, "old": eid})
-
-                                # Aggiorna il legame numerico (Indispensabile per il CASCADE)
-                                conn.execute(text("UPDATE registro_magazzino SET trattamento_id = :new WHERE trattamento_id = :old"), {"new": new_id, "old": eid})
-
-                                # AGGIORNA ANCHE LA NOTA (Per coerenza visiva nel registro)
-                                conn.execute(text("UPDATE registro_magazzino SET note = 'Scarico automatico T#' || :new WHERE note = 'Scarico automatico T#' || :old"), {"new": new_id, "old": eid})
-
-                            # Aggiorna figli (Contrade -> Tendoni)
-                            elif et == "CONTRADA":
-                                conn.execute(text("UPDATE tendoni SET contrada_id = :new WHERE contrada_id = :old"), {"new": new_id, "old": eid})
-
-                            # Aggiorna altre operazioni in coda
-                            conn.execute(text(
-                                "UPDATE pending_operations SET entity_id = :new "
-                                "WHERE entity_type = :et AND entity_id = :old"
-                            ), {"new": new_id, "et": et, "old": eid})
-
-                            # Riabilita trigger
-                            conn.execute(text("PRAGMA foreign_keys = ON"))
-                            conn.execute(text("UPDATE _sync_flags SET value = 0 WHERE key = 'downloading'"))
-                            log.info("ID swap %s: %s → %s", et, eid, new_id)
-
-                            # Aggiorna anche le operazioni successive nella lista in memoria
-                            for future_op in pending:
-                                if future_op["entity_type"] == et and str(future_op["entity_id"]) == str(eid):
-                                    future_op["entity_id"] = new_id
-                            # --------------------------------
+                new_id = _extract_new_id(resp)
+                table = ENTITY_TO_TABLE.get(et)
+                if new_id is not None and table:
+                    if str(new_id) != str(eid):
+                        _apply_id_swap(engine, et, table, eid, new_id, op["id"], pending)
+                        pending_op_deleted = True
                     else:
                         log.debug("ID coincidente %s: %s (nessuno swap necessario)", et, eid)
-                else:
-                    # SE ARRIVIAMO QUI, L'API NON HA RESTITUITO UN FORMATO VALIDO
+                elif new_id is None:
                     log.error("ID swap fallito: il server ha salvato ma non sono riuscito ad estrarre l'ID. resp=%r", resp)
 
-            _delete_op(engine, op["id"])
+            if not pending_op_deleted:
+                _delete_op(engine, op["id"])
             sent_ok += 1
 
         except NotAuthenticatedError:
-            # 401/403: il token JWT è scaduto o revocato. Non ha senso continuare
-            # né incrementare retry_count: tutte le op restanti darebbero lo stesso
-            # errore. Lasciamo l'op corrente in coda così sarà ritentata dopo il
-            # nuovo login, e propaghiamo l'eccezione al chiamante perché triggeri
-            # un re-login (gestito in MainWindow._handle_session_expired).
+            # 401/403: token JWT scaduto/revocato. Non incrementiamo retry_count:
+            # tutte le op successive avrebbero lo stesso esito. Propaghiamo
+            # al chiamante perché triggeri il re-login.
             log.warning("Token JWT scaduto/non valido; interrompo l'upload")
             raise
 
+        except NetworkError as e:
+            # NetworkError eredita da ApiError: va catturato PRIMA del clause
+            # ApiError generico. Altrimenti finirebbe in _handle_transient_error
+            # che incrementerebbe retry_count per ogni errore di rete, fino a
+            # spedire l'op in dead-letter dopo N tick offline. Qui rompiamo
+            # il for: la coda resta intatta e ritenteremo al prossimo tick.
+            log.debug("Errore di rete durante upload, riprovo al prossimo ciclo: %s", e)
+            break
+
         except ApiError as e:
-            # --- PROTEZIONE DA DATABASE LOCKED ---
-            # Se l'errore contiene la parola "locked", significa che la UI sta scrivendo.
-            # In questo caso non dobbiamo cancellare l'operazione, ma solo aspettare.
+            # "database locked": la UI sta scrivendo. Non cancellare l'op,
+            # solo aspettare il prossimo ciclo.
             if "locked" in str(e).lower():
                 log.debug("Database occupato (lock), riprovo al prossimo ciclo")
-                # 'break' interrompe il ciclo for delle operazioni pendenti.
-                # L'operazione corrente RIMANE nella tabella pending_operations.
                 break
 
-            # Se arriviamo qui, non è un lock, quindi è un errore reale dell'API o dei dati
             status = getattr(e, 'status_code', None)
             log.warning("Errore su op %s (%s/%s) status=%s: %s", op['id'], et, ot, status, e)
 
             if status == 404 and ot in ("UPDATE", "DELETE"):
-                # Il record non esiste più sul server (cancellato da altra istanza):
-                # rimuoviamo anche localmente. La pending op va scartata.
-                table = table_map.get(et)
-                if table:
-                    with engine.begin() as conn:
-                        conn.execute(text("UPDATE _sync_flags SET value = 1 WHERE key = 'downloading'"))
-                        if et == "TRATTAMENTO":
-                            conn.execute(text("DELETE FROM dettaglio_trattamenti WHERE trattamento_id = :id"), {"id": eid})
-                            conn.execute(text("DELETE FROM avvisi_trattamenti WHERE trattamento_id = :id"), {"id": eid})
-                            conn.execute(text("DELETE FROM registro_magazzino WHERE trattamento_id = :id"), {"id": eid})
-                        conn.execute(text(f"DELETE FROM {table} WHERE id = :id"), {"id": eid})
-                        conn.execute(text("UPDATE _sync_flags SET value = 0 WHERE key = 'downloading'"))
-                        log.info("Fantasma rimosso localmente (record server gone): %s #%s", et, eid)
-                if notifier is not None:
-                    notifier.on_record_gone(et, int(eid) if eid is not None else 0, ot)
-                _delete_op(engine, op["id"])
-
+                _handle_record_gone(engine, et, eid, ot, op["id"], notifier)
             elif ot == "INSERT" and status is not None and 400 <= status < 500:
-                # INSERT rifiutato dal server con un 4xx persistente (es. duplicato,
-                # validazione fallita). Non ha senso ritentare: cancelliamo sia la
-                # pending op che il record locale per evitare loop infiniti.
-                table = table_map.get(et)
-                if table:
-                    with engine.begin() as conn:
-                        conn.execute(text("UPDATE _sync_flags SET value = 1 WHERE key = 'downloading'"))
-                        if et == "TRATTAMENTO":
-                            conn.execute(text("DELETE FROM dettaglio_trattamenti WHERE trattamento_id = :id"), {"id": eid})
-                            conn.execute(text("DELETE FROM avvisi_trattamenti WHERE trattamento_id = :id"), {"id": eid})
-                            conn.execute(text("DELETE FROM registro_magazzino WHERE trattamento_id = :id"), {"id": eid})
-                        conn.execute(text(f"DELETE FROM {table} WHERE id = :id"), {"id": eid})
-                        conn.execute(text("UPDATE _sync_flags SET value = 0 WHERE key = 'downloading'"))
-                        log.warning("INSERT rifiutato dal server (%s): record locale %s #%s rimosso", status, et, eid)
-                if notifier is not None:
-                    summary = _payload_summary(et, payload)
-                    notifier.on_insert_rejected(et, summary, status)
-                _delete_op(engine, op["id"])
-
+                _handle_insert_rejected(engine, et, eid, status, payload, op["id"], notifier)
             else:
-                # Errori "transienti" (5xx, 422 random, ecc): incrementa retry_count.
-                # Oltre il max → dead-letter. Mantiene la pending op nella coda
-                # (non rotazione: l'ordine cronologico ha senso).
-                current_retry = int(op.get("retry_count", 0) or 0)
-                new_retry = current_retry + 1
-                if new_retry >= CONFIG.pending_retry_max:
-                    _move_to_dead_letter(engine, op, str(e), notifier=notifier)
-                else:
-                    log.info("Op %s in retry %d/%d (status=%s)",
-                             op['id'], new_retry, CONFIG.pending_retry_max, status)
-                    with engine.begin() as conn:
-                        conn.execute(text(
-                            "UPDATE pending_operations SET retry_count = :rc, last_error = :err "
-                            "WHERE id = :id"
-                        ), {"rc": new_retry, "err": str(e)[:500], "id": op["id"]})
-
-        except (NetworkError, NotAuthenticatedError):
-            # Errori di rete o sessione: fermiamo tutto e riproveremo tra 2 secondi
-            break
+                _handle_transient_error(engine, op, str(e), status, notifier)
 
     return (sent_ok, len(_list_pending(engine)), had_insert)

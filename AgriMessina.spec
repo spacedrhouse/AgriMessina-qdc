@@ -29,7 +29,12 @@ hiddenimports = [
     'pandas',           # import lazy dentro _esporta_selezionati
     'openpyxl',         # engine per pd.ExcelWriter
     'openpyxl.cell._writer',
-] + collect_submodules('sqlalchemy.dialects')
+    'reportlab',        # import lazy in _scrivi_pdf
+    '_version',         # generato da CI, contiene __version__ per l'update checker
+    'backup_manager',   # import lazy in main.run()
+    'migrations',       # import lazy in main.run()
+    'crash_reporter',   # import lazy in main.run()
+] + collect_submodules('sqlalchemy.dialects') + collect_submodules('reportlab')
 
 # Pacchetti grossi che non usiamo: tagliarli alleggerisce il bundle di ~30-100 MB.
 excludes = [

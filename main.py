@@ -22,15 +22,20 @@ import time
 from PyQt6.QtWidgets import (
     QApplication, QMainWindow, QWidget, QVBoxLayout, QHBoxLayout,
     QStackedWidget, QSplashScreen, QLabel, QFrame, QPushButton, QMessageBox,
-    QDialog, QTextEdit, QDialogButtonBox
+    QDialog, QTextEdit, QDialogButtonBox, QSystemTrayIcon, QMenu
 )
-from PyQt6.QtGui import QKeySequence, QShortcut, QFont, QColor, QPixmap, QIcon
-from PyQt6.QtCore import Qt, QCoreApplication, QTimer, QSettings
+from PyQt6.QtGui import QColor, QPixmap, QIcon, QAction
+from PyQt6.QtCore import Qt, QTimer, QSettings
 
 from dotenv import load_dotenv
 
-from api_client import ApiClient, NotAuthenticatedError
+from api_client import ApiClient, NetworkError, NotAuthenticatedError
 from events_listener import EventsListener
+from update_checker import UpdateCheckWorker, UpdateInfo
+try:
+    from _version import __version__ as APP_VERSION
+except ImportError:
+    APP_VERSION = "0.0.0-dev"
 from local_db import get_engine, init_local_database, reset_sync_state
 from sync import sync_all, reconcile_with_server, pull_trattamenti
 from pending_uploader import upload_pending
@@ -144,8 +149,25 @@ class FinestraPrincipale(QMainWindow):
         # --- SSE listener: push real-time dal server ---
         self.events_listener = EventsListener(self.api, parent=self)
         self.events_listener.event_received.connect(self._on_server_event)
+        self.events_listener.event_received.connect(self._on_event_notify)
         self.events_listener.connection_changed.connect(self._on_events_connection)
         self.events_listener.start()
+
+        # --- Tray icon + notifiche sistema ---
+        # Mostra notifiche native (toast Linux/Windows) per gli eventi
+        # SSE rilevanti. Setting `notifications_enabled` persistito in
+        # QSettings: l'utente può disabilitarle da menu tray.
+        self._setup_tray()
+        # Throttle: tempo dell'ultima notifica per evitare spam se arrivano
+        # eventi a raffica (es. import bulk).
+        self._last_notify_ts: float = 0.0
+
+        # --- Check aggiornamenti GitHub Releases ---
+        # Avviato in background, non blocca lo startup. Se trova una versione
+        # nuova mostra un dialog non invasivo (l'utente può posticipare).
+        self._update_worker = UpdateCheckWorker(APP_VERSION, parent=self)
+        self._update_worker.update_available.connect(self._on_update_available)
+        self._update_worker.start()
 
     def _build_ui(self):
         central = QWidget()
@@ -213,6 +235,19 @@ class FinestraPrincipale(QMainWindow):
         self.lbl_sync_state = QLabel("🟢 Sincronizzato")
         self.lbl_sync_state.setStyleSheet("color: #424242; font-size: 11px; background: transparent;")
         lstatus.addWidget(self.lbl_sync_state)
+
+        # Indicatore connessione SSE (push real-time dal server).
+        # Aggiornato da _on_events_connection. Pallino + tooltip esplicativo,
+        # così l'utente capisce a colpo d'occhio se sta ricevendo gli update
+        # in tempo reale o sta operando solo via polling fallback.
+        self.lbl_sse_state = QLabel("⚪ Connessione…")
+        self.lbl_sse_state.setStyleSheet("color: #757575; font-size: 11px; background: transparent;")
+        self.lbl_sse_state.setToolTip(
+            "Stato connessione push real-time col server.\n"
+            "Verde: ricevi gli update immediatamente.\n"
+            "Grigio: stai usando solo il polling periodico come fallback."
+        )
+        lstatus.addWidget(self.lbl_sse_state)
 
         self.lbl_sync_pending = QLabel("")
         self.lbl_sync_pending.setStyleSheet("color: #757575; font-size: 11px; background: transparent;")
@@ -330,6 +365,16 @@ class FinestraPrincipale(QMainWindow):
         if events_listener is not None and events_listener.isRunning():
             events_listener.stop()
             events_listener.wait(2000)
+        # Nascondi tray icon: senza, su alcuni DE resta "orfana" finché non
+        # passi col mouse sopra.
+        tray = getattr(self, "tray", None)
+        if tray is not None:
+            tray.hide()
+        # Chiude il pool httpx — evita "Unclosed client" warning a shutdown.
+        try:
+            self.api.close()
+        except Exception:
+            pass
         log.info("Chiusura applicazione")
         super().closeEvent(event)
 
@@ -427,8 +472,9 @@ class FinestraPrincipale(QMainWindow):
             with self.engine.connect() as conn:
                 n = conn.execute(text("SELECT COUNT(*) FROM pending_operations")).scalar() or 0
             self.notifier.pending(int(n))
-        except Exception:
-            pass
+        except Exception as e:
+            # Errore non bloccante (es. DB lockato 1s): log debug, no popup.
+            log.debug("pending_count fallito: %s", e)
 
     def _esegui_reconcile(self):
         """Allineamento automatico: scarica lo stato corrente dal server e
@@ -464,8 +510,7 @@ class FinestraPrincipale(QMainWindow):
             else:
                 msg_low = result.message.lower()
                 if "sessione scaduta" in msg_low or "sessione non valida" in msg_low:
-                    self._is_syncing = False
-                    self._aggiorna_pending_count()
+                    # _is_syncing viene resettato dal finally; non duplicare qui.
                     self._handle_session_expired()
                     return
                 if "rete" in msg_low:
@@ -475,8 +520,6 @@ class FinestraPrincipale(QMainWindow):
                     self.notifier.state("error")
                     self.notifier.warning(f"Reconcile: {result.message}")
         except NotAuthenticatedError:
-            self._is_syncing = False
-            self._aggiorna_pending_count()
             self._handle_session_expired()
             return
         except Exception as e:
@@ -568,13 +611,15 @@ class FinestraPrincipale(QMainWindow):
             self._is_syncing = False
             self._handle_session_expired()
             return
+        except NetworkError as e:
+            # NetworkError eredita da ApiError ma significa "rete giù", non
+            # un errore di app: marca offline e non logga warning per non
+            # spammare il log con ogni tick offline.
+            self.notifier.online = False
+            self.notifier.state("offline")
+            log.debug("Pull realtime offline: %s", e)
         except Exception as e:
-            msg = str(e).lower()
-            if "rete" in msg or "timeout" in msg or "connect" in msg:
-                self.notifier.online = False
-                self.notifier.state("offline")
-            else:
-                log.warning("Pull errore: %s", e)
+            log.warning("Pull errore: %s", e)
         finally:
             self._is_syncing = False
 
@@ -582,12 +627,12 @@ class FinestraPrincipale(QMainWindow):
         """Logica unificata di sincronizzazione (Upload + Download + Refresh Viste)."""
         self._is_syncing = True
         self.notifier.state("syncing")
+        result = None
         try:
             # 1. Esegui l'upload dei dati pendenti
             try:
                 sent, residual, had_insert = upload_pending(self.api, self.engine, notifier=self.notifier)
             except NotAuthenticatedError:
-                self._is_syncing = False
                 self._handle_session_expired()
                 return
 
@@ -609,24 +654,30 @@ class FinestraPrincipale(QMainWindow):
                         except Exception as e:
                             log.error("Sync-UI: errore refresh durante ID Swap: %s", e)
 
+            # 3. Procedi con il download dei nuovi dati dal Cloud
+            result = sync_all(self.api, self.engine)
+
+            # 4. Aggiorna le viste per mostrare i dati scaricati dal server
+            if result.ok:
+                for i in range(self.pagine.count()):
+                    page = self.pagine.widget(i)
+                    if hasattr(page, "aggiorna_dati"):
+                        try:
+                            page.aggiorna_dati()
+                        except Exception as e:
+                            log.error("Refresh error on %r: %s", page, e)
         except Exception as e:
-            log.error("Uploader: %s", e, exc_info=True)
-            self.notifier.error(f"Upload fallito: {e}")
+            log.error("Sync errore: %s", e, exc_info=True)
+            self.notifier.error(f"Sync fallito: {e}")
+        finally:
+            # Senza il finally, una qualsiasi exception dopo l'upload lasciava
+            # _is_syncing=True per sempre: i tick di _check_and_sync sarebbero
+            # tornati subito e l'app restava in stato "syncing" fino al riavvio.
+            self._is_syncing = False
 
-        # 3. Procedi con il download dei nuovi dati dal Cloud
-        result = sync_all(self.api, self.engine)
+        if result is None:
+            return
 
-        # 4. Aggiorna le viste per mostrare i dati scaricati dal server
-        if result.ok:
-            for i in range(self.pagine.count()):
-                page = self.pagine.widget(i)
-                if hasattr(page, "aggiorna_dati"):
-                    try:
-                        page.aggiorna_dati()
-                    except Exception as e:
-                        log.error("Refresh error on %r: %s", page, e)
-
-        self._is_syncing = False
         if result.ok:
             self.notifier.online = True
             self.notifier.state("idle")
@@ -675,8 +726,143 @@ class FinestraPrincipale(QMainWindow):
         if connected:
             self.notifier.online = True
             self.notifier.state("idle")
-        # Niente azione su disconnessione: il listener si auto-riconnette,
-        # e i timer di fallback coprono il vuoto temporaneo.
+            # Pallino verde, real-time attivo.
+            if hasattr(self, "lbl_sse_state"):
+                self.lbl_sse_state.setText("🟢 Real-time")
+                self.lbl_sse_state.setStyleSheet(
+                    "color: #2E7D32; font-size: 11px; background: transparent;"
+                )
+        else:
+            # Disconnessione: il listener si auto-riconnette con backoff,
+            # i timer di fallback coprono il vuoto temporaneo. Indichiamo
+            # all'utente che siamo in modalità degraded (solo polling).
+            if hasattr(self, "lbl_sse_state"):
+                self.lbl_sse_state.setText("⚪ Polling")
+                self.lbl_sse_state.setStyleSheet(
+                    "color: #9E9E9E; font-size: 11px; background: transparent;"
+                )
+
+    # ---- System tray + notifiche -------------------------------------
+
+    # Throttle minimo fra due notifiche consecutive (evita spam burst).
+    _NOTIFY_THROTTLE_S = 5.0
+
+    def _setup_tray(self):
+        """Crea l'icona di system tray con un menu minimal (toggle + esci).
+        Su sistemi senza tray (alcuni WM minimalisti) `isSystemTrayAvailable`
+        ritorna False e saltiamo gracefully."""
+        if not QSystemTrayIcon.isSystemTrayAvailable():
+            log.info("[tray] non disponibile sul sistema, skip")
+            self.tray = None
+            return
+
+        self.tray = QSystemTrayIcon(self)
+        self.tray.setIcon(QIcon(get_risorsa("icona.ico")))
+        self.tray.setToolTip("AgriMessina QDC")
+
+        menu = QMenu()
+        act_show = QAction("Mostra finestra", self)
+        act_show.triggered.connect(self._tray_show_window)
+        menu.addAction(act_show)
+
+        self.act_notify_toggle = QAction("Notifiche attive", self, checkable=True)
+        self.act_notify_toggle.setChecked(self._notifications_enabled())
+        self.act_notify_toggle.toggled.connect(self._toggle_notifications)
+        menu.addAction(self.act_notify_toggle)
+
+        menu.addSeparator()
+        act_quit = QAction("Esci", self)
+        act_quit.triggered.connect(self.close)
+        menu.addAction(act_quit)
+
+        self.tray.setContextMenu(menu)
+        self.tray.activated.connect(self._tray_activated)
+        self.tray.show()
+
+    def _tray_activated(self, reason):
+        # Doppio click sull'icona riporta in foreground la finestra.
+        if reason == QSystemTrayIcon.ActivationReason.DoubleClick:
+            self._tray_show_window()
+
+    def _tray_show_window(self):
+        self.show()
+        self.raise_()
+        self.activateWindow()
+
+    def _notifications_enabled(self) -> bool:
+        # QSettings restituisce string in alcuni casi → cast esplicito.
+        v = self._qsettings.value("notifications/enabled", True)
+        return str(v).lower() not in ("false", "0", "no")
+
+    def _toggle_notifications(self, enabled: bool):
+        self._qsettings.setValue("notifications/enabled", enabled)
+        log.info("[tray] notifiche %s", "attive" if enabled else "disattivate")
+
+    def _on_event_notify(self, event_type: str, payload: dict):
+        """Mostra una notifica nativa per gli eventi rilevanti dal server.
+
+        Filtro: solo eventi trattamenti_changed con op INSERT/DELETE (le
+        UPDATE generano troppo rumore e l'utente le vede comunque nella UI).
+        Throttle: niente notifiche più frequenti di una ogni 5s.
+        """
+        import time
+        if not getattr(self, "tray", None):
+            return
+        if not self._notifications_enabled():
+            return
+        if event_type != "trattamenti_changed":
+            return
+        op = (payload or {}).get("op")
+        if op not in ("INSERT", "DELETE"):
+            return
+
+        now = time.time()
+        if now - self._last_notify_ts < self._NOTIFY_THROTTLE_S:
+            return
+        self._last_notify_ts = now
+
+        tid = (payload or {}).get("id", "?")
+        if op == "INSERT":
+            title = "Nuovo trattamento"
+            body = f"Trattamento #{tid} aggiunto da un altro client."
+        else:
+            title = "Trattamento cancellato"
+            body = f"Trattamento #{tid} rimosso da un altro client."
+
+        # 4000 ms = durata default del toast su Windows/Linux. Su macOS
+        # è ignorato (li gestisce il Notification Center).
+        self.tray.showMessage(title, body, QSystemTrayIcon.MessageIcon.Information, 4000)
+
+    def _on_update_available(self, info: UpdateInfo):
+        """Notifica all'utente che c'è una versione più recente disponibile.
+
+        Non forziamo nulla: chiediamo se vuole aprire la pagina di download.
+        L'app continua a funzionare normalmente anche se l'utente sceglie
+        "più tardi" — il check si ripeterà al prossimo avvio.
+        """
+        msg = QMessageBox(self)
+        msg.setIcon(QMessageBox.Icon.Information)
+        msg.setWindowTitle("Aggiornamento disponibile")
+        notes_excerpt = (info.release_notes or "").strip().split("\n\n", 1)[0]
+        if len(notes_excerpt) > 400:
+            notes_excerpt = notes_excerpt[:400] + "…"
+        msg.setText(
+            f"<b>AgriMessina QDC {info.latest_version}</b> è disponibile.<br>"
+            f"Stai usando la versione <code>{APP_VERSION}</code>."
+        )
+        if notes_excerpt:
+            msg.setInformativeText(f"Novità:\n{notes_excerpt}")
+        btn_download = msg.addButton("Scarica", QMessageBox.ButtonRole.AcceptRole)
+        msg.addButton("Più tardi", QMessageBox.ButtonRole.RejectRole)
+        msg.exec()
+
+        if msg.clickedButton() is btn_download:
+            import webbrowser
+            # Se l'asset .exe non c'è nella release (es. build CI fallita),
+            # ripieghiamo sulla pagina della release: l'utente vede comunque
+            # cosa c'è e può scaricare manualmente.
+            url = info.download_url or info.release_url
+            webbrowser.open(url)
 
     def _handle_session_expired(self):
         """Gestisce la scadenza del token JWT.
@@ -724,9 +910,19 @@ class FinestraPrincipale(QMainWindow):
                 if timer:
                     timer.start(interval)
 
-            # Rilancia il listener SSE con il nuovo token.
+            # Rilancia il listener SSE con il nuovo token. L'istanza precedente
+            # è già stata stoppata sopra: la marchiamo per la cancellazione,
+            # altrimenti resterebbe come child di self e si accumulerebbe a ogni
+            # re-login.
+            old_listener = getattr(self, "events_listener", None)
+            if old_listener is not None:
+                old_listener.deleteLater()
             self.events_listener = EventsListener(self.api, parent=self)
             self.events_listener.event_received.connect(self._on_server_event)
+            # Stessa coppia di connessioni del setup iniziale: senza la seconda
+            # connect, le notifiche di sistema (toast tray) smettevano di
+            # funzionare dopo un re-login.
+            self.events_listener.event_received.connect(self._on_event_notify)
             self.events_listener.connection_changed.connect(self._on_events_connection)
             self.events_listener.start()
 
@@ -751,6 +947,11 @@ class FinestraPrincipale(QMainWindow):
 def run():
     setup_logging()
     log.info("=== Avvio AgriMessina QDC ===")
+
+    # Crash reporter PRIMA di tutto: cattura anche errori durante l'init.
+    from crash_reporter import setup_crash_reporter
+    setup_crash_reporter()
+
     app = QApplication(sys.argv)
 
     # --- AGGIUNGI QUESTA RIGA ---
@@ -779,38 +980,21 @@ def run():
 
     # 1. SQLite locale
     engine = get_engine()
+
+    # Backup del DB locale PRIMA di toccarlo. Niente connessioni aperte
+    # quando facciamo la copia → SQLite garantisce file autoconsistente.
+    from backup_manager import backup_if_due
+    from pathlib import Path
+    db_path = Path.home() / ".agrimessina" / "local.db"
+    backup_if_due(db_path)
+
     init_local_database(engine)
 
-    # Pulizia one-off del magazzino: ricalcola tutti gli scarichi automatici
-    # da zero per rimediare a inconsistenze accumulate da bug pregressi
-    # (note "T#<id_locale>" rimaste dopo lo swap di ID, scarichi duplicati
-    # da pull di trattamenti server-side, ecc). Esegue una sola volta nella
-    # vita del DB locale (marcato in _sync_flags).
-    from magazzino_logic import (
-        cleanup_magazzino_once_at_boot,
-        cleanup_for_server_authoritative_once,
-        repull_movimenti_for_origine_once,
-    )
-    cleanup_result = cleanup_magazzino_once_at_boot(engine)
-    if cleanup_result is not None:
-        n_del, n_ric = cleanup_result
-        log.info("Cleanup magazzino one-off: eliminati %d scarichi, ricalcolati %d trattamenti", n_del, n_ric)
-
-    # Migrazione al modello Server-Authoritative: il server ora calcola gli
-    # auto-scarichi server-side. Cancello tutti gli scarichi locali con
-    # trattamento_id valorizzato (sono frutto del vecchio modello client-side);
-    # verranno ri-pullati dal server al prossimo /magazzino/movimenti con i
-    # valori corretti.
-    n_del_auth = cleanup_for_server_authoritative_once(engine)
-    if n_del_auth is not None:
-        log.info("Migrazione server-authoritative: cancellati %d auto-scarichi locali (verranno ripullati dal server)", n_del_auth)
-
-    # Re-pull dei movimenti dopo l'aggiunta del campo azienda_id_origine al backend.
-    # Cancella i record con trattamento_id valorizzato (saranno ri-pullati dal server
-    # con il nuovo campo). Idempotente via marker `cleanup_origine_repull_done`.
-    n_del_origine = repull_movimenti_for_origine_once(engine)
-    if n_del_origine is not None:
-        log.info("Re-pull origine: cancellati %d auto-scarichi locali (verranno ripullati con azienda_id_origine)", n_del_origine)
+    # Migrazioni schema versionate. Idempotenti: niente effetti se non c'è
+    # nulla da applicare. La prima volta su un DB pre-esistente imposta la
+    # baseline alla versione corrente senza riapplicare nulla.
+    from migrations import apply_pending_migrations
+    apply_pending_migrations(engine)
 
     # 2. API client (con eventuale token già salvato)
     api = ApiClient(get_api_base_url())

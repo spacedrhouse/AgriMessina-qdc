@@ -4,7 +4,6 @@ from PyQt6.QtWidgets import (QVBoxLayout, QHBoxLayout, QPushButton, QMessageBox,
                              QFormLayout, QTableView, QHeaderView)
 from PyQt6.QtGui import QStandardItemModel, QStandardItem
 from PyQt6.QtCore import Qt
-from PyQt6.QtSql import QSqlQueryModel, QSqlDatabase
 
 # Importiamo le fondamenta dal nostro core
 from ui_core import PannelloBaseDialog, DelegateTendoniColorati
@@ -39,18 +38,17 @@ class DialogAzienda(QDialog):
             return
 
         try:
+            # I trigger SQL su aziende accodano automaticamente l'operazione in
+            # pending_operations (vedi local_db._install_triggers). NON aggiungere
+            # un enqueue_operation manuale qui: produrrebbe una pending op
+            # duplicata e quindi un INSERT/UPDATE duplicato sul server.
             with self.engine.begin() as conn:
                 if self.azienda_id:
                     conn.execute(text("UPDATE aziende SET nome = :n WHERE id = :id"),
                                  {"n": nome, "id": self.azienda_id})
-                    op_type, entity_id = "UPDATE", self.azienda_id
                 else:
-                    res = conn.execute(text("INSERT INTO aziende (nome) VALUES (:n)"),
-                                       {"n": nome})
-                    op_type, entity_id = "INSERT", res.lastrowid
-
-            from local_db import enqueue_operation
-            enqueue_operation(self.engine, "AZIENDA", op_type, entity_id=entity_id, payload={"nome": nome})
+                    conn.execute(text("INSERT INTO aziende (nome) VALUES (:n)"),
+                                 {"n": nome})
             self.accept()
 
         except Exception as e:
@@ -58,12 +56,6 @@ class DialogAzienda(QDialog):
                 QMessageBox.warning(self, "Duplicato", f"L'azienda '{nome}' esiste già.")
             else:
                 QMessageBox.critical(self, "Errore Database", str(e))
-
-        except Exception as e:
-            if "UNIQUE constraint failed" in str(e):
-                QMessageBox.warning(self, "Duplicato", f"L'azienda '{nome}' esiste già.")
-            else:
-                QMessageBox.critical(self, "Errore", str(e))
 
 class DialogGiacenzaAzienda(QDialog):
     def __init__(self, engine, azienda_id, nome_azienda, parent=None):
@@ -189,23 +181,19 @@ class DialogAgro(QDialog):
             return
 
         try:
-            # Transazione atomica: o salva tutto o non salva nulla
+            # I trigger SQL su agri si occupano dell'enqueue (vedi
+            # local_db._install_triggers). Non aggiungere un enqueue manuale:
+            # produrrebbe una pending op duplicata. Inoltre la chiamata
+            # precedente usava "AGRI" come entity_type, che non corrispondeva
+            # a nessuna entry di ENTITY_TO_TABLE: la pending op duplicata
+            # restava in coda finché non veniva scartata.
             with self.engine.begin() as conn:
                 if self.agri_id:
-                    # Caso MODIFICA
                     conn.execute(text("UPDATE agri SET nome=:n, azienda_id=:az WHERE id=:id"),
                                  {"n": nome, "az": az_id, "id": self.agri_id})
-                    op_type, entity_id = "UPDATE", self.agri_id
                 else:
-                    # Caso INSERIMENTO
-                    res = conn.execute(text("INSERT INTO agri (nome, azienda_id) VALUES (:n, :az)"),
-                                       {"n": nome, "az": az_id})
-                    op_type, entity_id = "INSERT", res.lastrowid
-
-            # Notifica al sistema di sincronizzazione solo dopo il successo locale
-            from local_db import enqueue_operation
-            enqueue_operation(self.engine, "AGRI", op_type, entity_id=entity_id,
-                              payload={"nome": nome, "azienda_id": az_id})
+                    conn.execute(text("INSERT INTO agri (nome, azienda_id) VALUES (:n, :az)"),
+                                 {"n": nome, "az": az_id})
 
             self.accept()
 
@@ -216,12 +204,6 @@ class DialogAgro(QDialog):
                                     f"L'agro '{nome}' esiste già per l'azienda selezionata.")
             else:
                 QMessageBox.critical(self, "Errore Database", f"Impossibile salvare: {str(e)}")
-
-        except Exception as e:
-            if "UNIQUE constraint failed" in str(e):
-                QMessageBox.warning(self, "Duplicato", f"L'agro '{nome}' esiste già per questa azienda.")
-            else:
-                QMessageBox.critical(self, "Errore", str(e))
 
 class PannelloAgri(PannelloBaseDialog):
     COLONNE_NASCOSTE = [0, 1]
@@ -302,18 +284,14 @@ class DialogContrada(QDialog):
         if not nome or not agri_id: return
 
         try:
+            # Trigger su contrade già accoda — niente enqueue manuale qui.
             with self.engine.begin() as conn:
                 if self.contrada_id:
                     conn.execute(text("UPDATE contrade SET nome=:n, agro_id=:ag WHERE id=:id"),
                                  {"n": nome, "ag": agri_id, "id": self.contrada_id})
-                    op_type, entity_id = "UPDATE", self.contrada_id
                 else:
-                    res = conn.execute(text("INSERT INTO contrade (nome, agro_id) VALUES (:n, :ag)"),
-                                       {"n": nome, "ag": agri_id})
-                    op_type, entity_id = "INSERT", res.lastrowid
-
-            from local_db import enqueue_operation
-            enqueue_operation(self.engine, "CONTRADA", op_type, entity_id=entity_id, payload={"nome": nome, "agro_id": agri_id})
+                    conn.execute(text("INSERT INTO contrade (nome, agro_id) VALUES (:n, :ag)"),
+                                 {"n": nome, "ag": agri_id})
             self.accept()
         except Exception as e:
             if "UNIQUE constraint failed" in str(e):
@@ -419,19 +397,15 @@ class DialogTendone(QDialog):
         if not codice or not contrada_id: return
 
         try:
+            # Trigger su tendoni già accoda — niente enqueue manuale qui.
             with self.engine.begin() as conn:
                 payload = {"codice": codice, "ettari": ettari, "contrada_id": contrada_id}
                 if self.tendone_id:
                     conn.execute(text("UPDATE tendoni SET codice=:codice, ettari=:ettari, contrada_id=:contrada_id WHERE id=:id"),
                                  {**payload, "id": self.tendone_id})
-                    op_type, entity_id = "UPDATE", self.tendone_id
                 else:
-                    res = conn.execute(text("INSERT INTO tendoni (codice, ettari, contrada_id) VALUES (:codice, :ettari, :contrada_id)"),
-                                       payload)
-                    op_type, entity_id = "INSERT", res.lastrowid
-
-            from local_db import enqueue_operation
-            enqueue_operation(self.engine, "TENDONE", op_type, entity_id=entity_id, payload=payload)
+                    conn.execute(text("INSERT INTO tendoni (codice, ettari, contrada_id) VALUES (:codice, :ettari, :contrada_id)"),
+                                 payload)
             self.accept()
         except Exception as e:
             if "UNIQUE constraint failed" in str(e):

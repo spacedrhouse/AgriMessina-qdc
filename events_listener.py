@@ -20,8 +20,7 @@ from __future__ import annotations
 
 import json
 import logging
-import time
-from typing import Optional
+import threading
 
 import httpx
 from PyQt6.QtCore import QThread, pyqtSignal
@@ -52,20 +51,25 @@ class EventsListener(QThread):
     def __init__(self, api, parent=None) -> None:
         super().__init__(parent)
         self.api = api
-        self._stop = False
+        # threading.Event invece di bool: permette di svegliare immediatamente
+        # i wait di backoff quando il main thread chiama stop(). Senza,
+        # un listener bloccato in time.sleep(30s) ritardava di 30s la
+        # chiusura dell'app o il restart post-login.
+        self._stop_event = threading.Event()
         self._connected = False
 
     def stop(self) -> None:
-        """Richiede la chiusura del thread. Il run() esce al prossimo iteration."""
-        self._stop = True
+        """Richiede la chiusura del thread. Sveglia immediatamente eventuali
+        wait di backoff così il thread esce in <1s."""
+        self._stop_event.set()
 
     def run(self) -> None:
         backoff = _BACKOFF_INITIAL_SECONDS
-        while not self._stop:
+        while not self._stop_event.is_set():
             if not self.api.is_authenticated:
-                # Senza token non possiamo nemmeno tentare. Aspettiamo che la
-                # MainWindow ci riavvii dopo il login (chiamando .start()).
-                time.sleep(backoff)
+                # Senza token, aspettiamo. wait() torna True se stop richiesto.
+                if self._stop_event.wait(timeout=backoff):
+                    return
                 backoff = min(backoff * 2, _BACKOFF_MAX_SECONDS)
                 continue
 
@@ -75,13 +79,14 @@ class EventsListener(QThread):
                 backoff = _BACKOFF_INITIAL_SECONDS
             except Exception as e:
                 self._set_connected(False)
-                if self._stop:
+                if self._stop_event.is_set():
                     return
                 log.warning(
                     "[events] listener errore: %s — riconnetto fra %.1fs",
                     e, backoff,
                 )
-                time.sleep(backoff)
+                if self._stop_event.wait(timeout=backoff):
+                    return
                 backoff = min(backoff * 2, _BACKOFF_MAX_SECONDS)
 
     def _set_connected(self, value: bool) -> None:
@@ -112,7 +117,7 @@ class EventsListener(QThread):
             self._set_connected(True)
             log.info("[events] stream connesso")
             for line in r.iter_lines():
-                if self._stop:
+                if self._stop_event.is_set():
                     return
                 if not line or line.startswith(":"):
                     # Keepalive comment o riga vuota separatore.

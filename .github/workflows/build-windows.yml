@@ -44,7 +44,17 @@ jobs:
         run: |
           python -m pip install --upgrade pip
           pip install -r requirements.txt
-          pip install pyinstaller pandas openpyxl
+          pip install pyinstaller pandas openpyxl reportlab
+
+      - name: Iniezione versione in _version.py
+        # Riscrive _version.py con la versione corrente del build, così
+        # l'app bundlata sa quale versione è e può confrontarla con la
+        # latest su GitHub Releases (update_checker.py).
+        shell: bash
+        run: |
+          echo "__version__ = \"${{ steps.version.outputs.version }}\"" > _version.py
+          echo "Contenuto _version.py:"
+          cat _version.py
 
       - name: Build con PyInstaller (--onedir)
         run: pyinstaller AgriMessina.spec --noconfirm --clean
@@ -66,12 +76,16 @@ jobs:
           "C:\Program Files (x86)\Inno Setup 6\ISCC.exe" /DAppVersion=${{ steps.version.outputs.version }} installer\AgriMessina.iss
 
       - name: Carica installer come artifact CI
+        # Skip se è una release (il file viene già allegato alla GitHub Release sotto)
+        # — evita doppia copia che mangia lo storage gratuito (~500MB).
+        if: github.event_name != 'push' || github.ref_type != 'tag'
         uses: actions/upload-artifact@v4
         with:
           name: AgriMessina-installer-${{ steps.version.outputs.version }}
           path: installer/output/*.exe
           if-no-files-found: error
-          retention-days: 30
+          # 7 giorni invece di 30: per test rapidi basta, riduce di 4x lo storage usato
+          retention-days: 7
 
       - name: Pubblica come Release GitHub (solo su push di tag)
         if: github.event_name == 'push' && github.ref_type == 'tag'

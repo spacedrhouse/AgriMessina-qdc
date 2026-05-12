@@ -7,7 +7,6 @@ Tabella speciale `sync_state(entity, server_time)` traccia l'ultimo timestamp
 di sync per ogni entità: lo riusiamo come `since=...` alla prossima sync.
 """
 from __future__ import annotations
-import os
 from pathlib import Path
 from typing import Optional
 
@@ -22,23 +21,19 @@ def _db_path() -> Path:
 
 
 def get_engine() -> Engine:
-    engine = create_engine(
+    return create_engine(
         f"sqlite:///{_db_path()}",
         connect_args={"check_same_thread": False},
         future=True,
     )
 
-    # Abilita il CASCADE su SQLite
-    @event.listens_for(engine, "connect")
-    def set_sqlite_pragma(dbapi_connection, connection_record):
-        cursor = dbapi_connection.cursor()
-        cursor.execute("PRAGMA foreign_keys=ON")
-        cursor.close()
 
-    return engine
-
+# Listener globale: abilita `PRAGMA foreign_keys=ON` ad ogni nuova connessione
+# di QUALUNQUE Engine SQLite, una sola volta. La registrazione locale (dentro
+# get_engine) c'era anche prima ma era duplicata — il listener girava DUE
+# volte per ogni connessione.
 @event.listens_for(Engine, "connect")
-def set_sqlite_pragma(dbapi_connection, connection_record):
+def _set_sqlite_pragma(dbapi_connection, connection_record):
     cursor = dbapi_connection.cursor()
     cursor.execute("PRAGMA foreign_keys=ON")
     cursor.close()
@@ -56,17 +51,18 @@ def init_local_database(engine: Engine) -> None:
             id INTEGER PRIMARY KEY,
             nome TEXT NOT NULL UNIQUE
         )"""))
+        # NOTA: niente UNIQUE(azienda_id, nome) su `agri` e (agro_id, nome)
+        # su `contrade`. Il backend non li impone, e averli localmente
+        # bloccava silenziosamente upsert validi server-side. Vedi migration v2.
         conn.execute(text("""CREATE TABLE IF NOT EXISTS agri (
             id INTEGER PRIMARY KEY,
             azienda_id INTEGER REFERENCES aziende(id),
-            nome TEXT NOT NULL,
-            UNIQUE(azienda_id, nome)
+            nome TEXT NOT NULL
         )"""))
         conn.execute(text("""CREATE TABLE IF NOT EXISTS contrade (
             id INTEGER PRIMARY KEY,
             agro_id INTEGER REFERENCES agri(id),
-            nome TEXT NOT NULL,
-            UNIQUE(agro_id, nome)
+            nome TEXT NOT NULL
         )"""))
         conn.execute(text("""CREATE TABLE IF NOT EXISTS tendoni (
             id INTEGER PRIMARY KEY,
@@ -133,12 +129,22 @@ def init_local_database(engine: Engine) -> None:
             note TEXT
         )"""))
 
-        # Migrazione idempotente per DB preesistenti: aggiungi azienda_id_origine se manca.
-        cols_rm = {r[1] for r in conn.execute(text("PRAGMA table_info(registro_magazzino)")).fetchall()}
-        if "azienda_id_origine" not in cols_rm:
-            conn.execute(text(
-                "ALTER TABLE registro_magazzino ADD COLUMN azienda_id_origine INTEGER REFERENCES aziende(id)"
-            ))
+        # Indici espliciti su colonne usate pesantemente in WHERE/IN dalle
+        # query magazzino (`WHERE rm.azienda_id IN (...)`). SQLite NON
+        # auto-indicizza le foreign key, e senza queste le viste per-azienda
+        # fanno full-scan sulla tabella.
+        conn.execute(text(
+            "CREATE INDEX IF NOT EXISTS idx_rm_azienda ON registro_magazzino(azienda_id)"
+        ))
+        conn.execute(text(
+            "CREATE INDEX IF NOT EXISTS idx_rm_azienda_origine ON registro_magazzino(azienda_id_origine)"
+        ))
+        conn.execute(text(
+            "CREATE INDEX IF NOT EXISTS idx_rm_prodotto ON registro_magazzino(prodotto_id)"
+        ))
+        conn.execute(text(
+            "CREATE INDEX IF NOT EXISTS idx_rm_trattamento ON registro_magazzino(trattamento_id)"
+        ))
 
         # Avvisi (calcolati localmente con la stessa logica del backend desktop)
         conn.execute(text("""CREATE TABLE IF NOT EXISTS avvisi_trattamenti (
@@ -167,14 +173,6 @@ def init_local_database(engine: Engine) -> None:
             last_error TEXT,
             created_at DATETIME DEFAULT CURRENT_TIMESTAMP
         )"""))
-
-        # Migrazione soft: aggiunge le colonne se la tabella è preesistente
-        # (DB creato da una versione precedente). PRAGMA table_info per checkare.
-        cols = {r[1] for r in conn.execute(text("PRAGMA table_info(pending_operations)")).fetchall()}
-        if "retry_count" not in cols:
-            conn.execute(text("ALTER TABLE pending_operations ADD COLUMN retry_count INTEGER NOT NULL DEFAULT 0"))
-        if "last_error" not in cols:
-            conn.execute(text("ALTER TABLE pending_operations ADD COLUMN last_error TEXT"))
 
         # Dead-letter: operazioni fallite definitivamente (oltre retry_count_max).
         # Conservate per audit/recupero manuale, mai ritentate automaticamente.

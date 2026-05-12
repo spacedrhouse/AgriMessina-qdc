@@ -5,10 +5,12 @@ from PyQt6.QtWidgets import (QVBoxLayout, QHBoxLayout, QPushButton, QMessageBox,
                              QSpinBox, QFormLayout, QScrollArea, QWidget, QDateEdit,
                              QTableView, QFileDialog, QHeaderView)
 from PyQt6.QtCore import Qt, QDate
-from PyQt6.QtSql import QSqlQueryModel, QSqlDatabase
 from PyQt6.QtGui import QStandardItemModel, QStandardItem
 
 from ui_core import PannelloBaseDialog, DelegateMovimenti
+from app_logging import get_logger
+
+log = get_logger(__name__)
 
 class DialogProdotto(QDialog):
     CAMPI = [
@@ -103,30 +105,20 @@ class DialogProdotto(QDialog):
             return
 
         try:
-            # L'uso di .begin() garantisce l'atomicità: o tutto o niente
+            # I trigger su prodotti accodano automaticamente l'operazione in
+            # pending_operations: niente enqueue manuale qui, altrimenti
+            # finirebbe in due pending op e quindi in due record server-side.
             with self.engine.begin() as conn:
                 if self.dati.get("id"):
-                    # MODIFICA
                     set_clause = ", ".join(f"{c} = :{c}" for c in valori)
                     valori["id"] = self.dati["id"]
                     conn.execute(text(f"UPDATE prodotti SET {set_clause} WHERE id = :id"), valori)
-                    op_type = "UPDATE"
-                    entity_id = self.dati["id"]
                 else:
-                    # INSERIMENTO
                     cols = ", ".join(valori.keys())
                     ph   = ", ".join(f":{c}" for c in valori)
                     # Se questo execute fallisce (es. nome duplicato),
-                    # il codice salta direttamente all'except e NON salva nulla
-                    res = conn.execute(text(f"INSERT INTO prodotti ({cols}) VALUES ({ph})"), valori)
-                    op_type = "INSERT"
-                    entity_id = res.lastrowid # Recupera l'ID appena generato
-
-            # Se siamo arrivati qui, il database locale è GIÀ AGGIORNATO e CHIUSO con successo.
-            # Ora possiamo dire al sistema di sincronizzazione di inviarlo al server
-            from local_db import enqueue_operation
-            enqueue_operation(self.engine, "PRODOTTO", op_type, entity_id=entity_id, payload=valori)
-
+                    # salta all'except e NON salva nulla.
+                    conn.execute(text(f"INSERT INTO prodotti ({cols}) VALUES ({ph})"), valori)
             self.accept()
 
         except Exception as e:
@@ -353,7 +345,6 @@ class DialogRegistroProdotto(QDialog):
 
         # ---> INIZIO SOSTITUZIONE CON QStandardItemModel <---
         self.modello_registro = QStandardItemModel()
-        from PyQt6.QtGui import QStandardItem
 
         with self.engine.connect() as conn:
             result = conn.execute(text(query_sql))
@@ -413,17 +404,15 @@ class DialogRegistroProdotto(QDialog):
 class PannelloProdotti(PannelloBaseDialog):
     COLONNE_NASCOSTE = [0]
 
-    def __init__(self, engine, db, azienda_filter: str | None = None, api=None):
+    def __init__(self, engine, db, azienda_filter: str, api):
         """
         Args:
-            azienda_filter: se valorizzato (es. "Agrimessina"), il pannello
-                mostra solo i movimenti/giacenze del magazzino di quell'azienda
+            azienda_filter: nome dell'azienda magazzino (es. "Agrimessina").
+                Il pannello mostra solo i movimenti/giacenze di quell'azienda
                 + degli alias che mappano su di essa (vedi WAREHOUSE_ALIASES).
-                Se None: aggregato totale come comportamento legacy.
-            api: ApiClient. Se valorizzato, il pulsante "Ricalcola scarichi"
+            api: ApiClient: serve per il pulsante "Ricalcola scarichi" che
                 triggera il rebuild server-side via POST /magazzino/ricalcola
-                seguito da un sync_all. Senza api fa un rebuild solo locale
-                (legacy, divergente dal server: da evitare).
+                seguito da un reconcile.
         """
         super().__init__()
         self.engine, self.db = engine, db
@@ -431,11 +420,9 @@ class PannelloProdotti(PannelloBaseDialog):
         self.azienda_filter = azienda_filter
         self.azienda_ids = self._resolve_filter_ids()  # lista per IN clause SQL
 
-        # Lo scarico magazzino è server-authoritative:
-        #   - INSERT/UPDATE/DELETE di un trattamento → backend chiama
-        #     magazzino_calculator.sincronizza_scarico (vedi app/routers/trattamenti_router.py)
-        #   - Il desktop NON ricalcola più localmente: si limita a sync da server.
-        # I vecchi pulsanti "Push Consumi" e "Annulla Push" sono stati rimossi.
+        # Lo scarico magazzino è server-authoritative: il backend chiama
+        # magazzino_calculator.sincronizza_scarico ad ogni write di trattamento.
+        # Il desktop si limita a sync.
         self.btn_export_tutti_mov = QPushButton("📊 Esporta Movimenti")
         self.btn_export_tutti_mov.setProperty('class', 'success')
         self.btn_export_tutti_mov.clicked.connect(self._esporta_tutti_movimenti)
@@ -487,12 +474,7 @@ class PannelloProdotti(PannelloBaseDialog):
         return f"AND {table_alias}.azienda_id IN ({ids_str})"
 
     def aggiorna_dati(self):
-        # La colonna "Giacenza Totale" mostra la giacenza filtrata per i
-        # magazzini di questa veduta. Se nessun filtro è applicato, mostra
-        # la giacenza globale (comportamento legacy).
-        giacenza_label = (
-            f"Giacenza ({self.azienda_filter})" if self.azienda_filter else "Giacenza Totale"
-        )
+        giacenza_label = f"Giacenza ({self.azienda_filter})"
         clausola_az = self._where_azienda_clause("rm")  # es. "AND rm.azienda_id IN (1,5)"
         query = f"""
             SELECT p.id, p.nome_prodotto AS "Nome Prodotto",
@@ -521,13 +503,6 @@ class PannelloProdotti(PannelloBaseDialog):
         automatico verrebbero comunque sincronizzati ma con ID nuovi, lasciando
         quelli vecchi come orfani nel locale).
         """
-        if self.api is None:
-            QMessageBox.warning(
-                self, "Non disponibile",
-                "Il pulsante richiede una sessione attiva con il server. "
-                "Riavvia l'app e riprova.",
-            )
-            return
         if QMessageBox.question(
             self, "Ricalcola scarichi",
             "Vuoi davvero ricalcolare TUTTI gli scarichi automatici sul server?\n\n"
@@ -576,7 +551,6 @@ class PannelloProdotti(PannelloBaseDialog):
             f_p += '.xlsx'
 
         try:
-            import pandas as pd
             # Filtra per i magazzini di questa veduta
             clausola_az_where = ""
             if self.azienda_ids:
@@ -683,8 +657,7 @@ class PannelloProdotti(PannelloBaseDialog):
         except ImportError:
             QMessageBox.critical(self, "Errore", "Per esportare in Excel servono le librerie pandas e openpyxl.\nInstallale con: pip install pandas openpyxl")
         except Exception as e:
-            import traceback
-            traceback.print_exc()
+            log.exception("Esportazione movimenti Excel fallita")
             QMessageBox.critical(self, "Errore", f"Esportazione fallita:\n{str(e)}")
 
     def _on_doppio_click(self, index):

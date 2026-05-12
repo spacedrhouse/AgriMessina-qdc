@@ -10,7 +10,6 @@ un oggetto duck-typed con i metodi giusti.
 """
 from __future__ import annotations
 from dataclasses import dataclass
-from typing import Optional
 from datetime import datetime
 
 from PyQt6.QtCore import QObject, pyqtSignal

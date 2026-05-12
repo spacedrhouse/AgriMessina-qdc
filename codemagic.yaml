@@ -1,0 +1,101 @@
+# Codemagic CI per AgriMessina QDC — Windows installer build.
+#
+# Setup richiesto su codemagic.io:
+#   1. Connetti il repo GitHub
+#   2. Settings → Environment variables (opzionale):
+#        - GITHUB_TOKEN: Personal Access Token con scope `repo` (per pubblicare release)
+#   3. Push di un tag `vX.Y.Z` → workflow parte da solo
+#   4. Manual run dal dashboard → workflow_dispatch equivalente
+#
+# Trade-off vs GitHub Actions: minuti più scarsi (500/mese gratis) ma più storage
+# artifact (5 GB). Vedi confronto nel commit message della prima versione.
+
+workflows:
+  build-windows-installer:
+    name: AgriMessina Windows Installer
+    # Macchina Windows. windows_x2 = 8 CPU / 32 GB RAM (più veloce di GH Actions)
+    instance_type: windows_x2
+    max_build_duration: 30
+
+    environment:
+      vars:
+        # Override-abile in workflow_dispatch dal dashboard Codemagic.
+        APP_VERSION: "0.0.0-dev"
+
+    triggering:
+      events:
+        - push
+        - tag
+      branch_patterns:
+        - pattern: main
+      tag_patterns:
+        - pattern: 'v*'
+
+    scripts:
+      - name: Determina versione
+        script: |
+          # Se è un tag (CM_TAG popolato), strip della "v" iniziale.
+          # Altrimenti usa APP_VERSION (dal env, default 0.0.0-dev).
+          if [ -n "$CM_TAG" ]; then
+            VERSION="${CM_TAG#v}"
+          else
+            VERSION="$APP_VERSION"
+          fi
+          echo "VERSION=$VERSION" >> $CM_ENV
+          echo "Versione build: $VERSION"
+
+      - name: Setup Python 3.12
+        script: |
+          # Codemagic Windows ha Python di default, ma allineiamo la versione
+          choco install python --version=3.12.7 -y --no-progress || true
+          python --version
+          python -m pip install --upgrade pip
+
+      - name: Install dipendenze Python
+        script: |
+          pip install -r requirements.txt
+          pip install pyinstaller pandas openpyxl
+
+      - name: Build con PyInstaller
+        script: |
+          pyinstaller AgriMessina.spec --noconfirm --clean
+
+      - name: Smoke test bundle
+        script: |
+          if (-Not (Test-Path "dist/AgriMessina/AgriMessina.exe")) {
+              Write-Error "AgriMessina.exe non creato"
+              exit 1
+          }
+          Get-Item dist/AgriMessina/AgriMessina.exe
+
+      - name: Install Inno Setup
+        script: |
+          choco install innosetup -y --no-progress
+
+      - name: Build installer
+        script: |
+          & "C:\Program Files (x86)\Inno Setup 6\ISCC.exe" /DAppVersion=$env:VERSION installer\AgriMessina.iss
+
+    artifacts:
+      - installer/output/*.exe
+
+    publishing:
+      # Pubblica come GitHub Release SOLO se è un tag push (vX.Y.Z).
+      # Richiede env var GITHUB_TOKEN configurato nel dashboard Codemagic.
+      scripts:
+        - name: Publish GitHub Release
+          script: |
+            if [ -z "$CM_TAG" ]; then
+              echo "Non è un tag push, skip release."
+              exit 0
+            fi
+            INSTALLER=$(find installer/output -name "*.exe" -type f | head -1)
+            if [ -z "$INSTALLER" ]; then
+              echo "Nessun installer trovato"; exit 1
+            fi
+            # gh CLI è preinstallato su Codemagic Windows
+            echo $GITHUB_TOKEN | gh auth login --with-token
+            gh release create "$CM_TAG" "$INSTALLER" \
+              --repo "$CM_REPO_OWNER/$CM_REPO_SLUG" \
+              --title "AgriMessina QDC $CM_TAG" \
+              --generate-notes

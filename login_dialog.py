@@ -3,8 +3,8 @@ from __future__ import annotations
 from typing import Optional
 
 from PyQt6.QtWidgets import (
-    QDialog, QVBoxLayout, QHBoxLayout, QLabel, QLineEdit, QPushButton,
-    QMessageBox, QFrame, QApplication
+    QDialog, QVBoxLayout, QLabel, QLineEdit, QPushButton,
+    QMessageBox, QApplication
 )
 from PyQt6.QtGui import QPixmap, QIcon
 from PyQt6.QtCore import Qt, QThread, pyqtSignal
@@ -115,8 +115,17 @@ class LoginDialog(QDialog):
         layout.addStretch()
 
     def _on_login(self):
+        # Guard reentrancy: returnPressed sulla password può scattare anche
+        # quando btn_login è disabilitato, e senza questa guardia un secondo
+        # Invio creerebbe un secondo LoginWorker prima che il primo finisca.
+        if self._worker is not None and self._worker.isRunning():
+            return
+
         user = self.et_username.text().strip()
-        pwd = self.et_password.text().strip()
+        # Niente .strip() sulla password: gli spazi possono far parte di una
+        # passphrase valida e silenziosamente strapparli causerebbe failure
+        # inspiegabili.
+        pwd = self.et_password.text()
         if not user or not pwd:
             QMessageBox.warning(self, "Campi vuoti", "Inserisci email e password.")
             return
@@ -125,6 +134,11 @@ class LoginDialog(QDialog):
         self.lbl_status.setText("Connessione in corso…")
         QApplication.processEvents()
 
+        # Pulisci il worker precedente prima di crearne uno nuovo: senza,
+        # un click ripetuto del pulsante creerebbe QThread orfani che restano
+        # come child del dialog finché chiude.
+        if self._worker is not None:
+            self._worker.deleteLater()
         self._worker = LoginWorker(self.api, user, pwd)
         self._worker.success.connect(self._on_login_success)
         self._worker.error.connect(self._on_login_error)

@@ -10,7 +10,7 @@ from __future__ import annotations
 import os
 import json
 import base64
-from typing import Optional, Any, List, Dict
+from typing import Optional, Any, Dict
 from pathlib import Path
 
 import httpx
@@ -232,6 +232,14 @@ class ApiClient:
         except Exception:
             pass
 
+    def close(self) -> None:
+        """Chiude il pool di connessioni httpx. Chiamare allo shutdown app
+        per evitare warning "Unclosed client". Non rimuove il token salvato."""
+        try:
+            self._client.close()
+        except Exception:
+            pass
+
     # ---- ANAGRAFICHE --------------------------------------------------------
 
     def sync_aziende(self, since: Optional[str] = None) -> Dict[str, Any]:
@@ -388,9 +396,24 @@ class ApiClient:
 
     # ---- HEALTH -------------------------------------------------------------
 
-    def health(self) -> Dict[str, Any]:
-        """Pinga il backend. Usato per capire se siamo online."""
-        return self._request("GET", "/health")
+    def health(self, timeout: float = 3.0) -> Dict[str, Any]:
+        """Pinga il backend. Usato allo startup per capire se siamo online.
+
+        Timeout breve (3s default) per non bloccare lo splash se il server è
+        lento/down. Bypassa il timeout di default di self._client (20s).
+        """
+        try:
+            resp = self._client.get("/health", headers=self._headers(), timeout=timeout)
+        except (httpx.ConnectError, httpx.ConnectTimeout, httpx.ReadTimeout) as e:
+            raise NetworkError(f"health timeout: {e}")
+        if resp.status_code in (401, 403):
+            raise NotAuthenticatedError("Sessione non valida", status_code=resp.status_code)
+        if resp.status_code >= 400:
+            raise ApiError(f"HTTP {resp.status_code} su /health", status_code=resp.status_code)
+        try:
+            return resp.json()
+        except Exception:
+            return {"status": "ok"}
 
 
 # ---- Helper -----------------------------------------------------------------

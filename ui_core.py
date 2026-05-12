@@ -1,18 +1,14 @@
-from datetime import datetime
 from sqlalchemy import text
-import os
 
 # --- IMPORT COMPLETI E ORDINATI ---
 from PyQt6.QtWidgets import (
-    QVBoxLayout, QHBoxLayout, QPushButton, QMessageBox, QDialog,
-    QComboBox, QLabel, QLineEdit, QDoubleSpinBox, QFormLayout,
-    QWidget, QDateEdit, QTableView, QFileDialog, QListWidget,
-    QListWidgetItem, QHeaderView, QFrame, QScrollArea, QApplication,
-    QStyledItemDelegate, QSpinBox, QStyle, QStyleOptionButton
+    QVBoxLayout, QHBoxLayout, QPushButton, QMessageBox,
+    QWidget, QTableView,
+    QHeaderView, QApplication,
+    QStyledItemDelegate,
 )
-from PyQt6.QtCore import Qt, QDate, QRect, QEvent, QPoint, QSortFilterProxyModel
-from PyQt6.QtSql import QSqlQueryModel
-from PyQt6.QtGui import QStandardItemModel, QStandardItem, QColor, QPalette, QPen
+from PyQt6.QtCore import Qt
+from PyQt6.QtGui import QStandardItemModel, QStandardItem, QColor, QPalette
 
 # In ui_core.py, sostituisci STYLE_AGRIMESSINA con questa versione corretta
 STYLE_AGRIMESSINA = """
@@ -272,26 +268,6 @@ STYLE_AGRIMESSINA = """
 
 """
 
-class DelegatoIntero(QStyledItemDelegate):
-    def createEditor(self, parent, option, index):
-        editor = QSpinBox(parent)
-        editor.setFrame(False)
-        editor.setMinimum(0)
-        editor.setMaximum(999999)
-        return editor
-
-class DelegatoDecimale(QStyledItemDelegate):
-    def createEditor(self, parent, option, index):
-        editor = QDoubleSpinBox(parent)
-        editor.setFrame(False)
-        editor.setMinimum(0.0)
-        editor.setMaximum(999999.99)
-        editor.setDecimals(2)
-        return editor
-
-from PyQt6.QtGui import QStandardItemModel, QStandardItem
-from sqlalchemy import text
-
 class PannelloBaseDialog(QWidget):
     COLONNE_NASCOSTE = []
 
@@ -459,90 +435,3 @@ class DelegateMovimenti(QStyledItemDelegate):
         painter.drawText(opt.rect.adjusted(5, 0, -5, 0), Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignVCenter, opt.text)
         painter.restore()
 
-class MultiFilterProxyModel(QSortFilterProxyModel):
-    def __init__(self, parent=None):
-        super().__init__(parent)
-        self.mappa_filtri = {}
-
-    def imposta_filtro_colonna(self, col, testo):
-        self.mappa_filtri[col] = testo.lower().strip()
-        self.invalidateFilter()
-
-    def filterAcceptsRow(self, r_src, p_src):
-        for col, txt in self.mappa_filtri.items():
-            if not txt: continue
-            val = str(self.sourceModel().data(self.sourceModel().index(r_src, col, p_src))).lower()
-            if txt not in val: return False
-        return True
-
-class DelegateConflittiStorico(QStyledItemDelegate):
-    def paint(self, painter, option, index):
-        riga_vera  = index.model().mapToSource(index).row()
-        violazione = index.model().sourceModel().record(riga_vera).value("Violazione")
-        if violazione == 1:
-            painter.save()
-            painter.fillRect(option.rect, QColor(255, 210, 210))
-            painter.restore()
-        super().paint(painter, option, index)
-
-class DelegateCheckboxStorico(QStyledItemDelegate):
-    def __init__(self, scheda, parent=None):
-        super().__init__(parent)
-        self.scheda = scheda
-
-    def paint(self, painter, option, index):
-        src_index = index.model().mapToSource(index)
-        rec = index.model().sourceModel().record(src_index.row())
-        tipo_viol = rec.value("TipoViolazione") or 0
-
-        opt = option.__class__(option)
-        self.initStyleOption(opt, index)
-
-        colori_bg = {
-            0: QColor("#FFFFFF"),
-            1: QColor("#FFEB3B"),
-            2: QColor("#F44336"),
-            3: QColor("#2196F3"),
-            4: QColor("#FFC107"),
-            5: QColor("#212121"),
-        }
-        colore_sfondo = colori_bg.get(tipo_viol, QColor("#FFFFFF"))
-
-        painter.save()
-        painter.fillRect(opt.rect, colore_sfondo)
-
-        if tipo_viol in (2, 3, 5):
-            painter.setPen(QColor("white"))
-        else:
-            painter.setPen(QColor("black"))
-
-        if index.column() == 1:
-            cb_size = 16
-            cb_rect = QRect(opt.rect.left() + 6, opt.rect.top() + (opt.rect.height() - cb_size) // 2, cb_size, cb_size)
-            painter.drawRect(cb_rect)
-            if rec.value("_ID_T") in self.scheda._checkbox_ids:
-                painter.setPen(QPen(QColor("white") if tipo_viol in (2,3,5) else QColor("black"), 2))
-                painter.drawLine(cb_rect.bottomLeft() + QPoint(3, -7), cb_rect.bottomLeft() + QPoint(7, -3))
-                painter.drawLine(cb_rect.bottomLeft() + QPoint(7, -3), cb_rect.topRight() + QPoint(-3, 4))
-
-            painter.drawText(opt.rect.adjusted(30, 0, 0, 0), Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignVCenter, opt.text)
-        else:
-            painter.drawText(opt.rect.adjusted(5, 0, -5, 0), Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignVCenter, opt.text)
-
-        painter.restore()
-
-    def editorEvent(self, event, model, option, index):
-        if index.column() == 1 and event.type() == QEvent.Type.MouseButtonRelease:
-            if event.button() == Qt.MouseButton.LeftButton:
-                cb_size = 16
-                cb_rect = QRect(option.rect.left() + 6, option.rect.top() + (option.rect.height() - cb_size) // 2, cb_size, cb_size)
-                if cb_rect.contains(event.position().toPoint()):
-                    src_index = model.mapToSource(index)
-                    id_t = model.sourceModel().record(src_index.row()).value("_ID_T")
-                    if id_t is not None:
-                        if id_t in self.scheda._checkbox_ids: self.scheda._checkbox_ids.discard(id_t)
-                        else: self.scheda._checkbox_ids.add(id_t)
-                        self.scheda._aggiorna_label_selezione()
-                        model.dataChanged.emit(index, index)
-                    return True
-        return super().editorEvent(event, model, option, index)
