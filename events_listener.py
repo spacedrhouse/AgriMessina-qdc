@@ -43,10 +43,16 @@ class EventsListener(QThread):
             che non gli interessano.
         connection_changed(bool connected):
             Cambio di stato connessione. Utile per badge UI offline/online.
+        auth_expired():
+            Il server ha respinto la connessione con 401: il token JWT è
+            scaduto o revocato. MainWindow deve aprire il LoginDialog.
+            Senza questo segnale il listener restava in retry-loop silente
+            e il timer di reconcile (30 min) era l'unico a notarsene.
     """
 
     event_received = pyqtSignal(str, dict)
     connection_changed = pyqtSignal(bool)
+    auth_expired = pyqtSignal()
 
     def __init__(self, api, parent=None) -> None:
         super().__init__(parent)
@@ -77,6 +83,22 @@ class EventsListener(QThread):
                 self._listen_one_session()
                 # Sessione chiusa pulitamente (es. server riavviato): reset del backoff.
                 backoff = _BACKOFF_INITIAL_SECONDS
+            except httpx.HTTPStatusError as e:
+                # 401/403 dal server: token scaduto o revocato. Inutile riprovare,
+                # serve il re-login. Emetti il segnale a MainWindow ed esci dal
+                # ciclo: la finestra fermerà esplicitamente questo thread prima
+                # di crearne uno nuovo post-login.
+                self._set_connected(False)
+                status = getattr(e.response, "status_code", None)
+                if status in (401, 403):
+                    log.warning("[events] auth scaduta (HTTP %s): triggero re-login", status)
+                    self.auth_expired.emit()
+                    return
+                # Altri HTTPStatusError: tratta come transient e riprova.
+                log.warning("[events] HTTP %s: riconnetto fra %.1fs", status, backoff)
+                if self._stop_event.wait(timeout=backoff):
+                    return
+                backoff = min(backoff * 2, _BACKOFF_MAX_SECONDS)
             except Exception as e:
                 self._set_connected(False)
                 if self._stop_event.is_set():

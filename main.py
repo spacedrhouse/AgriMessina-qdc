@@ -151,6 +151,10 @@ class FinestraPrincipale(QMainWindow):
         self.events_listener.event_received.connect(self._on_server_event)
         self.events_listener.event_received.connect(self._on_event_notify)
         self.events_listener.connection_changed.connect(self._on_events_connection)
+        # Token scaduto rilevato dall'SSE → triggera il dialog di re-login.
+        # Senza questa connessione, l'utente vedeva l'app "online" ma le sue
+        # azioni fallivano silenziosamente fino al successivo reconcile (30 min).
+        self.events_listener.auth_expired.connect(self._handle_session_expired)
         self.events_listener.start()
 
         # --- Tray icon + notifiche sistema ---
@@ -919,11 +923,12 @@ class FinestraPrincipale(QMainWindow):
                 old_listener.deleteLater()
             self.events_listener = EventsListener(self.api, parent=self)
             self.events_listener.event_received.connect(self._on_server_event)
-            # Stessa coppia di connessioni del setup iniziale: senza la seconda
-            # connect, le notifiche di sistema (toast tray) smettevano di
-            # funzionare dopo un re-login.
+            # Stessa quaterna di connessioni del setup iniziale: senza queste,
+            # dopo un re-login le notifiche tray sparivano e una eventuale
+            # seconda scadenza del token non triggerava più il LoginDialog.
             self.events_listener.event_received.connect(self._on_event_notify)
             self.events_listener.connection_changed.connect(self._on_events_connection)
+            self.events_listener.auth_expired.connect(self._handle_session_expired)
             self.events_listener.start()
 
             self.notifier.info("Sessione ripristinata")
@@ -933,13 +938,16 @@ class FinestraPrincipale(QMainWindow):
     def _on_logout_clicked(self):
         ans = QMessageBox.question(
             self, "Logout",
-            "Vuoi davvero uscire?\nI dati locali resteranno disponibili al prossimo accesso.",
+            "Vuoi davvero disconnetterti?\nI dati locali resteranno disponibili al prossimo accesso.",
             QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
         )
-        if ans == QMessageBox.StandardButton.Yes:
-            self.api.logout()
-            QMessageBox.information(self, "Logout", "Sei stato disconnesso. Riavvia per riloggarti.")
-            self.close()
+        if ans != QMessageBox.StandardButton.Yes:
+            return
+        # Riusiamo il flusso di _handle_session_expired: stoppa timer + SSE,
+        # apre il LoginDialog, riavvia tutto al re-login. Più pulito che far
+        # chiudere/riaprire l'app all'utente.
+        self.api.logout()
+        self._handle_session_expired()
 
 
 # ----------------------------- main -----------------------------------------
