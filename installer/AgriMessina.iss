@@ -31,16 +31,17 @@ AppUpdatesURL={#AppURL}
 AppCopyright={#AppCopyright}
 DefaultDirName={autopf}\AgriMessina
 DefaultGroupName=AgriMessina
-DisableProgramGroupPage=auto
+DisableProgramGroupPage=yes
+; Wizard ridotto al minimo: l'utente vede solo Welcome (= "vuoi installare?")
+; → barra di progresso → Finished. Niente license/directory/ready/tasks.
+DisableDirPage=yes
+DisableReadyPage=yes
 OutputBaseFilename=AgriMessina_Setup_{#AppVersion}
 ; Path relativi al file .iss (che vive in installer/). `output` qui significa
 ; installer/output/ — coerente col workflow CI che ci pesca gli artifact.
 OutputDir=output
 SetupIconFile=..\icona.ico
 UninstallDisplayIcon={app}\{#AppExeName}
-; LICENSE mostrato in una pagina del wizard di installazione. L'utente la
-; deve accettare prima di proseguire.
-LicenseFile=..\LICENSE
 Compression=lzma2/ultra
 SolidCompression=yes
 WizardStyle=modern
@@ -53,12 +54,8 @@ CloseApplications=yes
 RestartApplications=no
 
 [Languages]
+; Una sola lingua → Inno salta in automatico la pagina di selezione lingua.
 Name: "italian"; MessagesFile: "compiler:Languages\Italian.isl"
-Name: "english"; MessagesFile: "compiler:Default.isl"
-
-[Tasks]
-Name: "desktopicon"; Description: "{cm:CreateDesktopIcon}"; \
-    GroupDescription: "{cm:AdditionalIcons}"; Flags: unchecked
 
 [Files]
 ; "{#SourceDir}" è il path al risultato di PyInstaller. Di default `dist\AgriMessina`
@@ -68,9 +65,10 @@ Source: "..\dist\AgriMessina\*"; DestDir: "{app}"; \
     Flags: ignoreversion recursesubdirs createallsubdirs
 
 [Icons]
+; Icona desktop sempre creata (nessun Task → nessuna pagina di scelta).
 Name: "{group}\{#AppName}"; Filename: "{app}\{#AppExeName}"
 Name: "{group}\{cm:UninstallProgram,{#AppName}}"; Filename: "{uninstallexe}"
-Name: "{autodesktop}\{#AppName}"; Filename: "{app}\{#AppExeName}"; Tasks: desktopicon
+Name: "{autodesktop}\{#AppName}"; Filename: "{app}\{#AppExeName}"
 
 [Run]
 Filename: "{app}\{#AppExeName}"; \
