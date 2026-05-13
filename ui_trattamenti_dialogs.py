@@ -623,36 +623,68 @@ class DialogDettaglioTrattamento(QDialog):
             self._add_riga("Tendoni", d['tendoni_originali'])
 
             if getattr(self, 'nascondi_bilanciamenti', False) is False:
-                # Sezione: Scarichi di Bilanciamento
-                scarichi = conn.execute(text("""
-                SELECT
-                    dt_scarico.quantita_sostanza,
-                    p.unita_misura,
-                    -- Destinazione: match esatto di qta, altrimenti sequenza temporale
-                    (SELECT ten_dest.codice
-                     FROM dettaglio_trattamenti dt_carico
-                     JOIN tendoni ten_dest ON ten_dest.id = dt_carico.tendone_id
-                     JOIN trattamenti t_carico ON t_carico.id = dt_carico.trattamento_id
-                     WHERE dt_carico.is_bilanciamento = 1
-                       AND dt_carico.quantita_sostanza > 0
-                       AND t_carico.prodotto_id = p.id
-                       AND (
-                           ABS(dt_carico.quantita_sostanza - ABS(dt_scarico.quantita_sostanza)) < 0.001
-                           OR dt_carico.id > dt_scarico.id
-                       )
-                     ORDER BY
-                       CASE WHEN ABS(dt_carico.quantita_sostanza - ABS(dt_scarico.quantita_sostanza)) < 0.001 THEN 0 ELSE 1 END ASC,
-                       dt_carico.id ASC
-                     LIMIT 1
-                    ) AS tendone_destinazione
-                FROM dettaglio_trattamenti dt_scarico
-                JOIN trattamenti t ON t.id = dt_scarico.trattamento_id
-                JOIN prodotti p ON p.id = t.prodotto_id
-                WHERE dt_scarico.trattamento_id = :tid
-                  AND dt_scarico.is_bilanciamento = 1
-                  AND dt_scarico.quantita_sostanza < 0
-                ORDER BY dt_scarico.id
-            """), {"tid": tid}).mappings().all()
+                # Sezione: Scarichi di Bilanciamento.
+                # Riscritta a 2 step (lista scarichi + lookup destinazione per
+                # ognuno) perché la versione monolitica con correlated subquery
+                # + ORDER BY CASE su outer alias fallisce su SQLite < 3.39
+                # (Windows: alcuni build di Python embeddano versioni vecchie).
+                # Più verbosa ma portabile + più leggibile.
+                scarichi_raw = conn.execute(text("""
+                    SELECT dt.id AS scarico_id,
+                           dt.quantita_sostanza,
+                           p.id AS prodotto_id,
+                           p.unita_misura
+                    FROM dettaglio_trattamenti dt
+                    JOIN trattamenti t ON t.id = dt.trattamento_id
+                    JOIN prodotti p ON p.id = t.prodotto_id
+                    WHERE dt.trattamento_id = :tid
+                      AND dt.is_bilanciamento = 1
+                      AND dt.quantita_sostanza < 0
+                    ORDER BY dt.id
+                """), {"tid": tid}).mappings().all()
+
+                def _trova_tendone_dest(scarico_id: int, qta_abs: float, prodotto_id: int) -> str | None:
+                    """Per ogni scarico (qta negativa), trova il tendone di carico
+                    corrispondente: prima match esatto di quantità, altrimenti
+                    primo carico successivo (id maggiore) sullo stesso prodotto."""
+                    # Pass 1: match esatto di quantità (carico positivo == scarico in modulo).
+                    match = conn.execute(text("""
+                        SELECT ten.codice
+                        FROM dettaglio_trattamenti dt
+                        JOIN tendoni ten ON ten.id = dt.tendone_id
+                        JOIN trattamenti t ON t.id = dt.trattamento_id
+                        WHERE dt.is_bilanciamento = 1
+                          AND dt.quantita_sostanza > 0
+                          AND t.prodotto_id = :pid
+                          AND ABS(dt.quantita_sostanza - :qta_abs) < 0.001
+                        ORDER BY dt.id ASC
+                        LIMIT 1
+                    """), {"pid": prodotto_id, "qta_abs": qta_abs}).scalar()
+                    if match:
+                        return match
+                    # Pass 2: fallback temporale — primo carico con id maggiore.
+                    return conn.execute(text("""
+                        SELECT ten.codice
+                        FROM dettaglio_trattamenti dt
+                        JOIN tendoni ten ON ten.id = dt.tendone_id
+                        JOIN trattamenti t ON t.id = dt.trattamento_id
+                        WHERE dt.is_bilanciamento = 1
+                          AND dt.quantita_sostanza > 0
+                          AND t.prodotto_id = :pid
+                          AND dt.id > :sid
+                        ORDER BY dt.id ASC
+                        LIMIT 1
+                    """), {"pid": prodotto_id, "sid": scarico_id}).scalar()
+
+                scarichi = []
+                for s in scarichi_raw:
+                    qta_abs = abs(float(s['quantita_sostanza']))
+                    dest = _trova_tendone_dest(int(s['scarico_id']), qta_abs, int(s['prodotto_id']))
+                    scarichi.append({
+                        'quantita_sostanza': s['quantita_sostanza'],
+                        'unita_misura': s['unita_misura'],
+                        'tendone_destinazione': dest,
+                    })
 
             if scarichi:
                 self._add_sezione("Scarichi di Bilanciamento")
