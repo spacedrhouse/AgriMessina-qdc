@@ -315,10 +315,10 @@ class PannelloBaseDialog(QWidget):
         layout.addWidget(self.vista)
 
     # ---> NUOVO METODO PER ESEGUIRE LE QUERY <---
-    def esegui_query(self, query_sql, engine):
+    def esegui_query(self, query_sql, engine, params=None):
         self.modello.clear()
         with engine.connect() as conn:
-            result = conn.execute(text(query_sql))
+            result = conn.execute(text(query_sql), params or {})
             col_names = list(result.keys())
             self.modello.setHorizontalHeaderLabels(col_names)
 

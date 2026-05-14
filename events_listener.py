@@ -74,9 +74,12 @@ class EventsListener(QThread):
         while not self._stop_event.is_set():
             if not self.api.is_authenticated:
                 # Senza token, aspettiamo. wait() torna True se stop richiesto.
-                if self._stop_event.wait(timeout=backoff):
+                # NOTA: non raddoppiamo backoff qui — l'attesa è "tecnica" (manca
+                # auth), non un errore. Senza reset, dopo qualche minuto offline il
+                # backoff arrivava a 30s e il listener restava idle fino a 30s
+                # post-relogin invece di connettersi subito.
+                if self._stop_event.wait(timeout=_BACKOFF_INITIAL_SECONDS):
                     return
-                backoff = min(backoff * 2, _BACKOFF_MAX_SECONDS)
                 continue
 
             try:

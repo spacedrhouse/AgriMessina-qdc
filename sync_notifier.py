@@ -127,7 +127,16 @@ class SyncNotifier(QObject):
         except (TypeError, ValueError):
             return
         import time
-        self._recent_local_ids[key] = time.time()
+        now = time.time()
+        self._recent_local_ids[key] = now
+        # Sweep opportunistico: senza, le voci mai più riinterrogate
+        # (es. eco SSE mai arrivata) restavano nel dict indefinitamente.
+        # Costa O(N) ma N è piccolo (decine di voci); fatto solo ogni tanto.
+        if len(self._recent_local_ids) > 64:
+            cutoff = now - self._RECENT_LOCAL_TTL_S
+            self._recent_local_ids = {
+                k: v for k, v in self._recent_local_ids.items() if v > cutoff
+            }
 
     def was_recent_local(self, entity_type: str, entity_id) -> bool:
         """True se l'op è stata fatta da noi entro _RECENT_LOCAL_TTL_S."""

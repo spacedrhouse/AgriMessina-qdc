@@ -109,13 +109,29 @@ class DialogCompensaDisavanzo(QDialog):
                 return
 
             # 2. Situazione Tendone Origine
+            # Filtro temporale: i trattamenti scaduti (più vecchi di
+            # intervallo_min_tratt giorni) non concorrono al cumulativo per
+            # tendone. `:p_int_min` arriva da Python (già letto sopra).
             src = conn.execute(text("""
                 SELECT t.ettari,
-                       COALESCE((SELECT SUM(dt.quantita_sostanza) FROM dettaglio_trattamenti dt JOIN trattamenti tr ON tr.id = dt.trattamento_id WHERE tr.prodotto_id = :pid AND dt.tendone_id = t.id), 0),
-                       COALESCE((SELECT SUM(CASE WHEN dt.botti > 0 THEN dt.botti ELSE 0 END) FROM dettaglio_trattamenti dt JOIN trattamenti tr ON tr.id = dt.trattamento_id WHERE tr.prodotto_id = :pid AND dt.tendone_id = t.id), 0)
+                       COALESCE((SELECT SUM(dt.quantita_sostanza)
+                                 FROM dettaglio_trattamenti dt
+                                 JOIN trattamenti tr ON tr.id = dt.trattamento_id
+                                 WHERE tr.prodotto_id = :pid AND dt.tendone_id = t.id
+                                   AND (:p_int_min IS NULL OR :p_int_min <= 0
+                                        OR julianday('now') - julianday(tr.data_trattamento) <= :p_int_min)
+                                ), 0),
+                       COALESCE((SELECT SUM(CASE WHEN dt.botti > 0 THEN dt.botti ELSE 0 END)
+                                 FROM dettaglio_trattamenti dt
+                                 JOIN trattamenti tr ON tr.id = dt.trattamento_id
+                                 WHERE tr.prodotto_id = :pid AND dt.tendone_id = t.id
+                                   AND (:p_int_min IS NULL OR :p_int_min <= 0
+                                        OR julianday('now') - julianday(tr.data_trattamento) <= :p_int_min)
+                                ), 0)
                 FROM tendoni t
                 WHERE t.id = :tid
-            """), {"pid": self.prodotto_id, "tid": self.tendone_origine_id}).fetchone()
+            """), {"pid": self.prodotto_id, "tid": self.tendone_origine_id,
+                   "p_int_min": p_int_min}).fetchone()
 
             self.src_ettari = float(src[0])
             self.src_qta_tot = float(src[1])
@@ -128,20 +144,30 @@ class DialogCompensaDisavanzo(QDialog):
 
             self.src_max_removable = max(0.0, round(self.src_qta_tot - q_min, 4))
 
-            # 3. Estrazione Dati Grezzi per i Candidati (somme semplici in SQL)
+            # 3. Estrazione Dati Grezzi per i Candidati (somme semplici in SQL).
+            # Le somme di qta/botti applicano il filtro temporale `:p_int_min`:
+            # trattamenti scaduti non contribuiscono al cumulativo per tendone.
+            # I conteggi e le date dell'"ultimo trattamento" NON sono filtrati:
+            # restano informazioni storiche che la UI mostra all'utente.
             tendoni = conn.execute(text("""
                 SELECT
                     t.id, t.codice, t.ettari, LOWER(az.nome) AS az_nome,
 
-                    -- A) Quantità netta totale (somma di tutto: veri + bilanciamenti)
+                    -- A) Quantità netta totale ATTIVA (esclude trattamenti scaduti)
                     COALESCE((SELECT SUM(dt.quantita_sostanza)
                      FROM dettaglio_trattamenti dt JOIN trattamenti tr ON tr.id = dt.trattamento_id
-                     WHERE dt.tendone_id = t.id AND tr.prodotto_id = :pid), 0) AS net_qty,
+                     WHERE dt.tendone_id = t.id AND tr.prodotto_id = :pid
+                       AND (:p_int_min IS NULL OR :p_int_min <= 0
+                            OR julianday('now') - julianday(tr.data_trattamento) <= :p_int_min)
+                    ), 0) AS net_qty,
 
-                    -- B) Botti nette totali
+                    -- B) Botti nette totali (filtrate come sopra)
                     COALESCE((SELECT SUM(CASE WHEN dt.botti > 0 THEN dt.botti ELSE 0 END)
                      FROM dettaglio_trattamenti dt JOIN trattamenti tr ON tr.id = dt.trattamento_id
-                     WHERE dt.tendone_id = t.id AND tr.prodotto_id = :pid), 0) AS net_botti,
+                     WHERE dt.tendone_id = t.id AND tr.prodotto_id = :pid
+                       AND (:p_int_min IS NULL OR :p_int_min <= 0
+                            OR julianday('now') - julianday(tr.data_trattamento) <= :p_int_min)
+                    ), 0) AS net_botti,
 
                     -- C) Numero di trattamenti VERI (ignora i bilanciamenti per i limiti di etichetta)
                     (SELECT COUNT(DISTINCT tr.id)
@@ -161,7 +187,8 @@ class DialogCompensaDisavanzo(QDialog):
                 JOIN agri ag ON ag.id = c.agro_id
                 JOIN aziende az ON az.id = ag.azienda_id
                 WHERE t.id != :tid
-            """), {"pid": self.prodotto_id, "tid": self.tendone_origine_id}).fetchall()
+            """), {"pid": self.prodotto_id, "tid": self.tendone_origine_id,
+                   "p_int_min": p_int_min}).fetchall()
 
             oggi = datetime.now().date()
             candidati = []
@@ -558,6 +585,13 @@ class DialogCompensaSottodose(QDialog):
         self.um = str(um or "").lower()
         self.is_hl = "/hl" in self.um
 
+        # Finestra di validità del prodotto (giorni). Le query di candidati
+        # source/tendone usano questo per scartare trattamenti "scaduti".
+        with self.engine.connect() as conn:
+            self.p_int_min = conn.execute(text(
+                "SELECT intervallo_min_tratt FROM prodotti WHERE id = :pid"
+            ), {"pid": self.prodotto_id}).scalar()
+
         self.setWindowTitle(f"Bilancia Sottodosaggio — {nome_prodotto}")
         self.setMinimumWidth(750)
         self.setMinimumHeight(420)
@@ -601,6 +635,9 @@ class DialogCompensaSottodose(QDialog):
         tendone target (non si preleva da se stessi).
         """
         with self.engine.connect() as conn:
+            # Filtro temporale: i trattamenti scaduti (più vecchi di
+            # intervallo_min_tratt giorni) non sono candidati come source di
+            # prelievo perché il loro prodotto non è più "attivo" sul tendone.
             rows = conn.execute(text("""
                 SELECT
                     tr.id AS tratt_id,
@@ -619,9 +656,12 @@ class DialogCompensaSottodose(QDialog):
                 WHERE tr.prodotto_id = :pid
                   AND tr.is_autorizzato = 1
                   AND dt.tendone_id != :tid_target
+                  AND (:p_int_min IS NULL OR :p_int_min <= 0
+                       OR julianday('now') - julianday(tr.data_trattamento) <= :p_int_min)
                 GROUP BY tr.id, dt.tendone_id
                 HAVING qta > 0
-            """), {"pid": self.prodotto_id, "tid_target": self.tendone_id}).fetchall()
+            """), {"pid": self.prodotto_id, "tid_target": self.tendone_id,
+                   "p_int_min": self.p_int_min}).fetchall()
 
         candidati = []
         for r in rows:
@@ -654,6 +694,9 @@ class DialogCompensaSottodose(QDialog):
         prodotto: la qta si somma, la dose risultante potrebbe rientrare.
         """
         with self.engine.connect() as conn:
+            # `qta_esistente`/`botti_esistente`: solo trattamenti attivi (non scaduti).
+            # La dose risultante sul tendone candidato è calcolata sommando solo
+            # la qta attualmente "valida" + la qta che verrebbe spostata.
             rows = conn.execute(text("""
                 SELECT
                     t.id, t.codice, t.ettari, az.nome AS az_nome,
@@ -662,19 +705,24 @@ class DialogCompensaSottodose(QDialog):
                         FROM dettaglio_trattamenti dt2
                         JOIN trattamenti tr2 ON tr2.id = dt2.trattamento_id
                         WHERE dt2.tendone_id = t.id AND tr2.prodotto_id = :pid
+                          AND (:p_int_min IS NULL OR :p_int_min <= 0
+                               OR julianday('now') - julianday(tr2.data_trattamento) <= :p_int_min)
                     ), 0) AS qta_esistente,
                     COALESCE((
                         SELECT SUM(CASE WHEN dt3.botti > 0 THEN dt3.botti ELSE 0 END)
                         FROM dettaglio_trattamenti dt3
                         JOIN trattamenti tr3 ON tr3.id = dt3.trattamento_id
                         WHERE dt3.tendone_id = t.id AND tr3.prodotto_id = :pid
+                          AND (:p_int_min IS NULL OR :p_int_min <= 0
+                               OR julianday('now') - julianday(tr3.data_trattamento) <= :p_int_min)
                     ), 0) AS botti_esistente
                 FROM tendoni t
                 JOIN contrade c ON c.id = t.contrada_id
                 JOIN agri ag ON ag.id = c.agro_id
                 JOIN aziende az ON az.id = ag.azienda_id
                 WHERE t.id != :tid_target
-            """), {"pid": self.prodotto_id, "tid_target": self.tendone_id}).fetchall()
+            """), {"pid": self.prodotto_id, "tid_target": self.tendone_id,
+                   "p_int_min": self.p_int_min}).fetchall()
 
         candidati = []
         for r in rows:
@@ -938,17 +986,17 @@ class DialogCompensaSottodose(QDialog):
                 "<b>Nessun tendone candidato per uno spostamento.</b>"
             ))
             layout.addWidget(QLabel(
-                "Strategia di ultima istanza: <b>cancella il trattamento</b>. "
-                f"La quantità di <b>{self.qta_tot_target:.4f} "
-                f"{self.um.split('/')[0]}</b> torna disponibile nel magazzino "
-                "fittizio."
+                "Strategia di ultima istanza: <b>annulla la revisione</b>. Il "
+                "trattamento torna nello Storico come proposta e la quantità "
+                f"di <b>{self.qta_tot_target:.4f} {self.um.split('/')[0]}</b> "
+                "torna disponibile nel magazzino fittizio."
             ))
             btns = QHBoxLayout()
             btns.addStretch()
             btn_annulla = QPushButton("Annulla")
             btn_annulla.clicked.connect(self.reject)
-            btn_cancella = QPushButton("🗑️ Cancella Trattamento")
-            btn_cancella.setProperty("class", "danger")
+            btn_cancella = QPushButton("↩️ Annulla Revisione")
+            btn_cancella.setProperty("class", "warning")
             btn_cancella.clicked.connect(self._cancella_trattamento_target)
             btns.addWidget(btn_annulla)
             btns.addWidget(btn_cancella)
@@ -1109,10 +1157,13 @@ class DialogCompensaSottodose(QDialog):
     # ────────────────────────────────────────────────────────────────
 
     def _cancella_trattamento_target(self):
-        """Strategia C: cancella il trattamento revisionato target.
+        """Strategia C: annulla la revisione del trattamento target.
 
-        SOLO il trattamento target viene cancellato. La sua qta torna nel
-        magazzino fittizio (via cancellazione del suo scarico).
+        Il trattamento NON viene cancellato: torna nello Storico come
+        proposta (is_autorizzato=1 → 0) e la sua qta è di nuovo disponibile
+        nel magazzino fittizio. Senza, il DELETE rimuoveva l'unica riga
+        di `trattamenti` e quindi la proposta originale spariva insieme
+        alla revisione, contrariamente alle aspettative dell'utente.
 
         Gli altri trattamenti collegati (source originali o altri sub) NON
         vengono toccati in alcun modo: i loro dt restano invariati e il
@@ -1120,11 +1171,19 @@ class DialogCompensaSottodose(QDialog):
         consapevole: il bilanciamento è "annullato" lato target, ma le
         contropartite contabili sui source restano come traccia.
 
-        Reale: non toccato in nessun caso (snapshot congelato)."""
+        I dt di bilanciamento (is_bilanciamento=1) ricevuti dal target
+        durante la revisione che stiamo annullando vengono rimossi: erano
+        carichi virtuali validi solo nel contesto della revisione, e
+        lasciarli farebbe ricomparire la qta bilanciata se l'utente
+        ri-revisiona.
+
+        Reale: non toccato in nessun caso (snapshot congelato).
+        """
         risposta = QMessageBox.question(
-            self, "Cancella Trattamento",
-            f"Confermi la cancellazione del trattamento revisionato di "
+            self, "Annulla Revisione",
+            f"Confermi l'annullamento della revisione del trattamento di "
             f"<b>{self.nome_prodotto}</b> su questo tendone?<br><br>"
+            f"Il trattamento tornerà nello <b>Storico</b> come proposta. "
             f"La quantità di <b>{self.qta_tot_target:.4f} "
             f"{self.um.split('/')[0]}</b> tornerà disponibile nel magazzino "
             f"fittizio. Il magazzino reale e gli altri trattamenti collegati "
@@ -1151,33 +1210,40 @@ class DialogCompensaSottodose(QDialog):
                                          "Trattamento revisionato non trovato.")
                     return
 
-                # Cancella scarico fittizio del SOLO target (reale: congelato).
+                # Cancella scarico fittizio del target (reale: congelato).
                 cancella_scarico_fittizio(conn, target_tratt_id)
 
-                # DELETE solo della testata target + sue righe figlie.
-                # Nessuna pulizia su altri trattamenti collegati: la qta
-                # negativa eventuale nei source resta come traccia.
+                # Rimuovi SOLO i dt di bilanciamento (carichi ricevuti durante
+                # la revisione). I dt originali della proposta (bil=0) restano.
+                conn.execute(text(
+                    "DELETE FROM dettaglio_trattamenti "
+                    "WHERE trattamento_id = :id AND is_bilanciamento = 1"
+                ), {"id": target_tratt_id})
+
+                # Avvisi rimossi qui per UI immediata; vengono ricalcolati
+                # subito dopo da ricalcola_avvisi_globali e dal server.
                 conn.execute(text(
                     "DELETE FROM avvisi_trattamenti WHERE trattamento_id = :id"
                 ), {"id": target_tratt_id})
+
+                # REVOCA della revisione: 1 → 0. Niente DELETE della testata,
+                # altrimenti spariva anche dallo Storico.
                 conn.execute(text(
-                    "DELETE FROM dettaglio_trattamenti WHERE trattamento_id = :id"
-                ), {"id": target_tratt_id})
-                conn.execute(text(
-                    "DELETE FROM trattamenti WHERE id = :id"
+                    "UPDATE trattamenti SET is_autorizzato = 0 WHERE id = :id"
                 ), {"id": target_tratt_id})
 
-            # Backend: notifica delete del solo target.
-            enqueue_operation(self.engine, "TRATTAMENTO", "DELETE",
+            # Backend: notifica la revoca (endpoint /trattamenti/{id}/revoca).
+            enqueue_operation(self.engine, "TRATTAMENTO", "REVOCA",
                               entity_id=target_tratt_id)
             ricalcola_avvisi_globali(self.engine)
 
             self.accept()
             QMessageBox.information(
-                self, "Trattamento cancellato",
-                "Il trattamento è stato cancellato. Il prodotto è disponibile "
-                "nel magazzino fittizio. Gli altri trattamenti collegati "
-                "non sono stati modificati.",
+                self, "Revisione annullata",
+                "La revisione è stata annullata. Il trattamento è di nuovo "
+                "nello Storico e il prodotto è disponibile nel magazzino "
+                "fittizio. Gli altri trattamenti collegati non sono stati "
+                "modificati.",
             )
         except Exception as e:
             QMessageBox.critical(self, "Errore", f"Operazione fallita:\n{str(e)}")
@@ -1232,12 +1298,17 @@ class DialogDettaglioTrattamento(QDialog):
                     FROM dettaglio_trattamenti dt2
                     JOIN trattamenti t2 ON t2.id = dt2.trattamento_id
                     WHERE dt2.tendone_id = ten.id AND t2.prodotto_id = p.id
+                      -- I trattamenti scaduti non concorrono al cumulativo per tendone.
+                      AND (p.intervallo_min_tratt IS NULL OR p.intervallo_min_tratt <= 0
+                           OR julianday('now') - julianday(t2.data_trattamento) <= p.intervallo_min_tratt)
                 ) AS qta_netta_cumulativa,
                 (
                     SELECT SUM(CASE WHEN dt2.botti > 0 THEN dt2.botti ELSE 0 END)
                     FROM dettaglio_trattamenti dt2
                     JOIN trattamenti t2 ON t2.id = dt2.trattamento_id
                     WHERE dt2.tendone_id = ten.id AND t2.prodotto_id = p.id
+                      AND (p.intervallo_min_tratt IS NULL OR p.intervallo_min_tratt <= 0
+                           OR julianday('now') - julianday(t2.data_trattamento) <= p.intervallo_min_tratt)
                 ) AS botti_tot_cumulativi
             FROM dettaglio_trattamenti dt
             JOIN trattamenti t ON t.id = dt.trattamento_id
@@ -1335,6 +1406,7 @@ class DialogDettaglioTrattamento(QDialog):
             self._add_riga("Operatore", d['operatore'])
             self._add_riga("Tendoni", d['tendoni_originali'])
 
+            scarichi = []
             if getattr(self, 'nascondi_bilanciamenti', False) is False:
                 # Sezione: Scarichi di Bilanciamento.
                 # Riscritta a 2 step (lista scarichi + lookup destinazione per
@@ -1389,7 +1461,6 @@ class DialogDettaglioTrattamento(QDialog):
                         LIMIT 1
                     """), {"pid": prodotto_id, "sid": scarico_id}).scalar()
 
-                scarichi = []
                 for s in scarichi_raw:
                     qta_abs = abs(float(s['quantita_sostanza']))
                     dest = _trova_tendone_dest(int(s['scarico_id']), qta_abs, int(s['prodotto_id']))
@@ -1506,7 +1577,13 @@ class DialogStoricoProdottiTendone(QDialog):
 
     def _carica(self):
         with self.engine.connect() as conn:
-            filtro_sql = f"AND p.id = {self.prodotto_filtrato_id}" if self.prodotto_filtrato_id else ""
+            # Filtro bindato (vedi params più sotto): evita interpolazione diretta.
+            filtro_sql = "AND p.id = :pid" if self.prodotto_filtrato_id else ""
+            # NOTA: "Qta Totale" e "Dose Cumulativa" considerano SOLO i trattamenti
+            # attivi (non scaduti rispetto a intervallo_min_tratt). I trattamenti
+            # scaduti restano comunque visibili nello Storico/Revisionati e sono
+            # contati in "N° Trattamenti" + "Ultimo": la riga non sparisce, ma
+            # i totali non sovradimensionano la dose.
             # Per /hl il volume d'acqua è SOMMA(botti) × 10 hl (botti reali),
             # con fallback a ettari × 10 quando non risultano botti (record
             # storici incompleti). Usare gli ettari come stima quando esistono
@@ -1514,28 +1591,40 @@ class DialogStoricoProdottiTendone(QDialog):
             righe = conn.execute(text(f"""
                 SELECT
                     p.nome_prodotto, p.unita_misura, COUNT(DISTINCT t.id),
-                    ROUND(SUM(dt.quantita_sostanza), 4),
+                    ROUND(SUM(CASE WHEN (p.intervallo_min_tratt IS NULL OR p.intervallo_min_tratt <= 0
+                                          OR julianday('now') - julianday(t.data_trattamento) <= p.intervallo_min_tratt)
+                                   THEN dt.quantita_sostanza ELSE 0 END), 4) AS qta_attiva,
 
-                    -- Dose cumulativa = qta_totale / volume_acqua effettivo
+                    -- Dose cumulativa = qta_attiva / volume_acqua effettivo (su botti attive)
                     ROUND(CASE
                         WHEN LOWER(p.unita_misura) LIKE '%/hl' THEN
-                            SUM(dt.quantita_sostanza) /
-                            (CASE WHEN COALESCE(SUM(dt.botti), 0) > 0
-                                  THEN SUM(dt.botti) * 10.0
+                            SUM(CASE WHEN (p.intervallo_min_tratt IS NULL OR p.intervallo_min_tratt <= 0
+                                            OR julianday('now') - julianday(t.data_trattamento) <= p.intervallo_min_tratt)
+                                     THEN dt.quantita_sostanza ELSE 0 END) /
+                            (CASE WHEN COALESCE(SUM(CASE WHEN (p.intervallo_min_tratt IS NULL OR p.intervallo_min_tratt <= 0
+                                                                OR julianday('now') - julianday(t.data_trattamento) <= p.intervallo_min_tratt)
+                                                          THEN dt.botti ELSE 0 END), 0) > 0
+                                  THEN SUM(CASE WHEN (p.intervallo_min_tratt IS NULL OR p.intervallo_min_tratt <= 0
+                                                       OR julianday('now') - julianday(t.data_trattamento) <= p.intervallo_min_tratt)
+                                                THEN dt.botti ELSE 0 END) * 10.0
                                   ELSE :ettari * 10.0
                              END)
-                        ELSE SUM(dt.quantita_sostanza) / :ettari
+                        ELSE SUM(CASE WHEN (p.intervallo_min_tratt IS NULL OR p.intervallo_min_tratt <= 0
+                                             OR julianday('now') - julianday(t.data_trattamento) <= p.intervallo_min_tratt)
+                                      THEN dt.quantita_sostanza ELSE 0 END) / :ettari
                     END, 1) as d_cum,
 
                     0, MAX(t.data_trattamento), p.min_sostanza, p.max_sostanza,
-                    COALESCE(SUM(dt.botti), 0) AS botti_tot
+                    COALESCE(SUM(CASE WHEN (p.intervallo_min_tratt IS NULL OR p.intervallo_min_tratt <= 0
+                                             OR julianday('now') - julianday(t.data_trattamento) <= p.intervallo_min_tratt)
+                                       THEN dt.botti ELSE 0 END), 0) AS botti_tot
                 FROM dettaglio_trattamenti dt
                 JOIN trattamenti t ON t.id = dt.trattamento_id
                 JOIN prodotti p ON p.id = t.prodotto_id
                 WHERE dt.tendone_id = :tid {filtro_sql}
                 GROUP BY p.id
                 ORDER BY MAX(t.data_trattamento) DESC
-            """), {"tid": self.tendone_id, "ettari": self.ettari}).fetchall()
+            """), {"tid": self.tendone_id, "ettari": self.ettari, "pid": self.prodotto_filtrato_id}).fetchall()
 
         if not righe:
             self.tabella.setModel(QStandardItemModel(1, 1))
@@ -1591,6 +1680,13 @@ class DialogStoricoProdottiTendone(QDialog):
 
         with self.engine.connect() as conn:
             limiti = conn.execute(text("SELECT id, max_sostanza, unita_misura FROM prodotti WHERE nome_prodotto=:n"), {"n": nome_prodotto}).fetchone()
+
+            # Race: il prodotto può essere stato cancellato (es. da altro client) tra _carica
+            # e questo click. limiti[1] su None crasherebbe.
+            if limiti is None:
+                QMessageBox.warning(self, "Prodotto non trovato",
+                                    f"Il prodotto '{nome_prodotto}' non esiste più. Riapri il dialog.")
+                return
 
             # Blocco se mancano i limiti d'etichetta: serve sia max che min.
             if not limiti[1] or float(limiti[1]) <= 0:

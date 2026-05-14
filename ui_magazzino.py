@@ -12,6 +12,34 @@ from app_logging import get_logger
 
 log = get_logger(__name__)
 
+
+# Conversione fra UM compatibili. Storiamo le qta nel registro nel numeratore
+# di `unita_misura` (l'UM "interna" del prodotto), ma l'utente inserisce i
+# carichi nella sua `unita_carico`. Al salvataggio convertiamo, alla lettura
+# riconvertiamo.
+_MASSA_AL_KG = {"mg": 1e-6, "g": 1e-3, "kg": 1.0}
+_VOLUME_AL_L = {"ml": 1e-3, "l": 1.0}
+
+
+def converti_qta(qta: float, da_um: str | None, a_um: str | None) -> float:
+    """Converte `qta` da `da_um` a `a_um`. Identità se UM uguali, vuote o
+    sconosciute (es. "Unità"), o se le due UM appartengono a categorie diverse
+    (massa ↔ volume non è una conversione valida).
+
+    Esempi: converti_qta(1, "kg", "g") → 1000; converti_qta(500, "ml", "l") → 0.5.
+    """
+    if not da_um or not a_um or qta is None:
+        return qta
+    da = str(da_um).strip().lower()
+    a = str(a_um).strip().lower()
+    if da == a:
+        return qta
+    if da in _MASSA_AL_KG and a in _MASSA_AL_KG:
+        return qta * _MASSA_AL_KG[da] / _MASSA_AL_KG[a]
+    if da in _VOLUME_AL_L and a in _VOLUME_AL_L:
+        return qta * _VOLUME_AL_L[da] / _VOLUME_AL_L[a]
+    return qta
+
 class DialogProdotto(QDialog):
     CAMPI = [
         ("nome_prodotto",            "Nome Prodotto *",            "text",         None),
@@ -27,11 +55,27 @@ class DialogProdotto(QDialog):
         ("trattamenti_max",          "Max Trattamenti/Anno",       "intero",       None),
         ("intervallo_min_tratt",     "Intervallo Minimo (giorni)", "intero",       None),
         ("unita_misura",             "Unità di Misura",            "combo",        ["", "L/ha", "kg/ha", "ml/ha", "g/ha", "g/hl", "ml/hl", "unità/ha"]),
+        ("unita_carico",             "Unità di Carico",            "combo",        [""]),
         ("min_sostanza",             "Dose Minima",                "decimal",      None),
         ("max_sostanza",             "Dose Massima",               "decimal",      None),
         ("qta_acqua",                "Quantità Acqua (L/ha)",      "decimal",      None),
         ("blacklist",                "Blacklist",                  "combo",        ["No", "Si"]),
     ]
+
+    @staticmethod
+    def opzioni_unita_carico(unita_misura: str | None) -> list[str]:
+        """UM ammesse per i carichi manuali in funzione del numeratore di
+        `unita_misura`. Lista vuota se l'UM non è ancora stata scelta."""
+        if not unita_misura:
+            return []
+        num = str(unita_misura).split('/')[0].strip().lower()
+        if num in ('mg', 'g', 'kg'):
+            return ['mg', 'g', 'kg']
+        if num in ('ml', 'l'):
+            return ['ml', 'l']
+        if num == 'unità':
+            return ['Unità']
+        return []
 
     def __init__(self, engine, dati=None, parent=None):
         super().__init__(parent)
@@ -78,6 +122,17 @@ class DialogProdotto(QDialog):
             self.widget_map[campo] = (w, tipo)
             form.addRow(etichetta, w)
 
+        # Cablaggio dinamico: la lista di "Unità di Carico" dipende dal
+        # numeratore di "Unità di Misura". Cambiandola, ripopoliamo l'altro
+        # combo (preservando il valore corrente se ancora valido).
+        um_w, _ = self.widget_map["unita_misura"]
+        uc_w, _ = self.widget_map["unita_carico"]
+        um_w.currentTextChanged.connect(self._aggiorna_opzioni_unita_carico)
+        # Popolamento iniziale: usa il valore di unita_misura corrente
+        # (in apertura il combo è già stato settato sopra).
+        self._aggiorna_opzioni_unita_carico(um_w.currentText(),
+                                            preserva=self.dati.get("unita_carico"))
+
         btns = QHBoxLayout()
         btn_salva   = QPushButton("💾 Salva")
         btn_annulla = QPushButton("Annulla")
@@ -91,6 +146,33 @@ class DialogProdotto(QDialog):
         btns.addWidget(btn_annulla)
         outer.addLayout(btns)
 
+    def _aggiorna_opzioni_unita_carico(self, unita_misura: str,
+                                        preserva: str | None = None) -> None:
+        """Ripopola il combo "Unità di Carico" in base al numeratore dell'UM.
+        Preserva la selezione corrente se ancora valida nella nuova lista."""
+        uc_w, _ = self.widget_map["unita_carico"]
+        valore_corrente = preserva if preserva is not None else uc_w.currentText().strip()
+
+        opzioni = [""] + self.opzioni_unita_carico(unita_misura)
+
+        uc_w.blockSignals(True)
+        uc_w.clear()
+        uc_w.addItems(opzioni)
+        if valore_corrente and valore_corrente in opzioni:
+            uc_w.setCurrentText(valore_corrente)
+        else:
+            # Niente match: default sull'unità "standard" (l'ultima della lista,
+            # tipicamente kg per massa, l per volume, Unità per unità).
+            if len(opzioni) > 1:
+                uc_w.setCurrentText(opzioni[-1])
+        uc_w.blockSignals(False)
+
+    @staticmethod
+    def _numeratore_um(um: str | None) -> str | None:
+        if not um:
+            return None
+        return str(um).split('/')[0].strip().lower()
+
     def salva(self):
         valori = {}
         for campo, (w, tipo) in self.widget_map.items():
@@ -103,6 +185,40 @@ class DialogProdotto(QDialog):
         if not valori.get("nome_prodotto"):
             QMessageBox.critical(self, "Errore", "Il campo 'Nome Prodotto' è obbligatorio!")
             return
+
+        # Guardia: cambio del numeratore di `unita_misura` su un prodotto che
+        # ha già carichi/scarichi manuali. Le qta nel registro sono storate
+        # nel numeratore vecchio; con il nuovo numeratore vengono interpretate
+        # in modo diverso (es. 10 "kg" → 10 "g" = 1000x meno sostanza), falsando
+        # dose cumulativa e giacenze. Avvisa esplicitamente prima di salvare.
+        if self.dati.get("id"):
+            old_num = self._numeratore_um(self.dati.get("unita_misura"))
+            new_num = self._numeratore_um(valori.get("unita_misura"))
+            if old_num and new_num and old_num != new_num:
+                with self.engine.connect() as conn:
+                    n_mov = conn.execute(text(
+                        "SELECT COUNT(*) FROM registro_magazzino "
+                        "WHERE prodotto_id = :pid AND trattamento_id IS NULL"
+                    ), {"pid": self.dati["id"]}).scalar() or 0
+                if n_mov > 0:
+                    risposta = QMessageBox.warning(
+                        self, "Attenzione: cambio unità di misura",
+                        f"Stai cambiando l'unità di misura del prodotto da "
+                        f"<b>{self.dati.get('unita_misura')}</b> a "
+                        f"<b>{valori.get('unita_misura')}</b>.<br><br>"
+                        f"Esistono <b>{n_mov}</b> carichi/scarichi manuali storici "
+                        f"per questo prodotto, registrati nell'UM <b>{old_num}</b>. "
+                        f"Il loro valore numerico resta invariato ma sarà ora "
+                        f"interpretato come <b>{new_num}</b>, falsando dosi e "
+                        f"giacenze (es. 10 {old_num} verranno letti come 10 {new_num}).<br><br>"
+                        f"Prima di procedere considera di convertire manualmente i "
+                        f"valori storici, oppure di rimuoverli.<br><br>"
+                        f"Procedere comunque?",
+                        QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+                        QMessageBox.StandardButton.No,
+                    )
+                    if risposta != QMessageBox.StandardButton.Yes:
+                        return
 
         try:
             # I trigger su prodotti accodano automaticamente l'operazione in
@@ -132,10 +248,16 @@ class DialogProdotto(QDialog):
                 QMessageBox.critical(self, "Errore Database", f"Salvataggio fallito: {messaggio}")
 
 class DialogNuovoMovimento(QDialog):
-    def __init__(self, engine, prodotto_id, um, parent=None):
+    def __init__(self, engine, prodotto_id, um, parent=None, unita_carico=None):
         super().__init__(parent)
         self.engine = engine
         self.prodotto_id = prodotto_id
+        # `um`: numeratore di unita_misura del prodotto (es. "g"); è l'unità
+        # interna in cui il registro_magazzino storerà la quantità.
+        # `unita_carico`: unità con cui l'utente inserisce (es. "kg"). Se None
+        #  o uguale a `um`, nessuna conversione viene applicata.
+        self.um_interna = str(um or "")
+        self.unita_carico = str(unita_carico or "").strip() or self.um_interna
         self.setWindowTitle("Registra Movimento Magazzino")
         self.setMinimumWidth(400)
 
@@ -153,9 +275,18 @@ class DialogNuovoMovimento(QDialog):
                 self.combo_azienda.addItem(az[1], userData=az[0])
 
         self.spin_qta = QDoubleSpinBox()
-        self.spin_qta.setRange(0.01, 999999.99)
+        # Min 1e-6 (= 1 mg in kg, 1 µl in l): carichi piccoli convertiti
+        # in UM grandi (es. 5 g salvati come 0.005 kg) altrimenti verrebbero
+        # clippati al minimo del widget e ri-salvati come valore errato.
+        self.spin_qta.setRange(0.000001, 999999.99)
         self.spin_qta.setDecimals(4)
-        self.spin_qta.setSuffix(f" {um}")
+        self.spin_qta.setSuffix(f" {self.unita_carico}")
+
+        # Etichetta informativa: mostra il valore convertito nell'UM interna,
+        # così l'utente capisce in quale unità il registro lo storerà.
+        self.lbl_convertito = QLabel("")
+        self.lbl_convertito.setStyleSheet("color: #757575; font-size: 11px;")
+        self.spin_qta.valueChanged.connect(self._aggiorna_anteprima_conversione)
 
         self.edit_ddt = QLineEdit()
         self.edit_fornitore = QLineEdit()
@@ -165,6 +296,9 @@ class DialogNuovoMovimento(QDialog):
         form.addRow("Tipo Operazione:", self.combo_tipo)
         form.addRow("Azienda Proprietaria:", self.combo_azienda)
         form.addRow("Quantità:", self.spin_qta)
+        if self.unita_carico.lower() != self.um_interna.lower() and self.um_interna:
+            form.addRow("", self.lbl_convertito)
+            self._aggiorna_anteprima_conversione(self.spin_qta.value())
         form.addRow("N° DDT (Opzionale):", self.edit_ddt)
         form.addRow("Fornitore (Opzionale):", self.edit_fornitore)
         form.addRow("Note:", self.edit_note)
@@ -177,8 +311,20 @@ class DialogNuovoMovimento(QDialog):
         btns.addWidget(btn_salva)
         layout.addLayout(btns)
 
+    def _aggiorna_anteprima_conversione(self, valore: float) -> None:
+        convertito = converti_qta(valore, self.unita_carico, self.um_interna)
+        self.lbl_convertito.setText(
+            f"≡ {convertito:.4f} {self.um_interna} nel registro"
+        )
+
     def salva(self):
         try:
+            # Arrotondo a 6 decimali: senza, ogni open-save degrada per
+            # imprecisione float (es. 0.7 kg -> 699.999...g, salvato, riaperto
+            # -> 0.6999... kg, salvato, ecc). 6 decimali sono sufficienti per
+            # tutte le UM supportate (mg = 1e-6 kg).
+            qta_storage = round(converti_qta(self.spin_qta.value(),
+                                             self.unita_carico, self.um_interna), 6)
             with self.engine.begin() as conn:
                 conn.execute(text("""
                     INSERT INTO registro_magazzino (prodotto_id, azienda_id, data_movimento, tipo_movimento, quantita, n_ddt, fornitore, note)
@@ -186,7 +332,7 @@ class DialogNuovoMovimento(QDialog):
                 """), {
                     "pid": self.prodotto_id, "az": self.combo_azienda.currentData(),
                     "d": self.data_edit.date().toPyDate(), "tipo": self.combo_tipo.currentText(),
-                    "q": self.spin_qta.value(), "ddt": self.edit_ddt.text().strip() or None,
+                    "q": qta_storage, "ddt": self.edit_ddt.text().strip() or None,
                     "fornitore": self.edit_fornitore.text().strip() or None, "note": self.edit_note.text().strip() or None
                 })
             self.accept()
@@ -194,10 +340,16 @@ class DialogNuovoMovimento(QDialog):
 
 
 class DialogModificaMovimento(QDialog):
-    def __init__(self, engine, dati, um, parent=None):
+    def __init__(self, engine, dati, um, parent=None, unita_carico=None):
         super().__init__(parent)
         self.engine = engine
         self.id_mov = dati['id']
+        # Stessa semantica di DialogNuovoMovimento: l'UI parla in `unita_carico`,
+        # il DB stora in `um_interna`. La qta che arriva in `dati['qta']` è già
+        # in `um_interna` (letta dal registro), quindi va convertita per la
+        # visualizzazione e ri-convertita al salvataggio.
+        self.um_interna = str(um or "")
+        self.unita_carico = str(unita_carico or "").strip() or self.um_interna
         self.setWindowTitle("Modifica Movimento Magazzino")
 
         layout = QVBoxLayout(self)
@@ -220,9 +372,20 @@ class DialogModificaMovimento(QDialog):
                 if az[0] == dati['azienda_id']: self.combo_azienda.setCurrentIndex(self.combo_azienda.count() - 1)
 
         self.spin_qta = QDoubleSpinBox()
-        self.spin_qta.setRange(0.01, 999999.99)
+        # Min 1e-6 (= 1 mg in kg, 1 µl in l): carichi piccoli convertiti
+        # in UM grandi (es. 5 g salvati come 0.005 kg) altrimenti verrebbero
+        # clippati al minimo del widget e ri-salvati come valore errato.
+        self.spin_qta.setRange(0.000001, 999999.99)
         self.spin_qta.setDecimals(4)
-        self.spin_qta.setValue(dati['qta'])
+        self.spin_qta.setSuffix(f" {self.unita_carico}")
+        # Converte la qta storata (in um_interna) verso unita_carico per
+        # mostrarla nell'UM con cui l'utente l'aveva inserita.
+        self.spin_qta.setValue(converti_qta(float(dati['qta']),
+                                            self.um_interna, self.unita_carico))
+
+        self.lbl_convertito = QLabel("")
+        self.lbl_convertito.setStyleSheet("color: #757575; font-size: 11px;")
+        self.spin_qta.valueChanged.connect(self._aggiorna_anteprima_conversione)
 
         self.edit_ddt = QLineEdit(str(dati['ddt'] or ""))
         self.edit_fornitore = QLineEdit(str(dati['fornitore'] or ""))
@@ -232,6 +395,9 @@ class DialogModificaMovimento(QDialog):
         form.addRow("Tipo Operazione:", self.combo_tipo)
         form.addRow("Azienda Proprietaria:", self.combo_azienda)
         form.addRow("Quantità:", self.spin_qta)
+        if self.unita_carico.lower() != self.um_interna.lower() and self.um_interna:
+            form.addRow("", self.lbl_convertito)
+            self._aggiorna_anteprima_conversione(self.spin_qta.value())
         form.addRow("N° DDT:", self.edit_ddt)
         form.addRow("Fornitore:", self.edit_fornitore)
         form.addRow("Note:", self.edit_note)
@@ -242,15 +408,27 @@ class DialogModificaMovimento(QDialog):
         btn_salva.clicked.connect(self.salva)
         layout.addWidget(btn_salva)
 
+    def _aggiorna_anteprima_conversione(self, valore: float) -> None:
+        convertito = converti_qta(valore, self.unita_carico, self.um_interna)
+        self.lbl_convertito.setText(
+            f"≡ {convertito:.4f} {self.um_interna} nel registro"
+        )
+
     def salva(self):
         try:
+            # Arrotondo a 6 decimali: senza, ogni open-save degrada per
+            # imprecisione float (es. 0.7 kg -> 699.999...g, salvato, riaperto
+            # -> 0.6999... kg, salvato, ecc). 6 decimali sono sufficienti per
+            # tutte le UM supportate (mg = 1e-6 kg).
+            qta_storage = round(converti_qta(self.spin_qta.value(),
+                                             self.unita_carico, self.um_interna), 6)
             with self.engine.begin() as conn:
                 conn.execute(text("""
                     UPDATE registro_magazzino SET azienda_id=:az, data_movimento=:d, tipo_movimento=:tipo,
                     quantita=:q, n_ddt=:ddt, fornitore=:fornitore, note=:note WHERE id=:id
                 """), {
                     "az": self.combo_azienda.currentData(), "d": self.data_edit.date().toPyDate(),
-                    "tipo": self.combo_tipo.currentText(), "q": self.spin_qta.value(),
+                    "tipo": self.combo_tipo.currentText(), "q": qta_storage,
                     "ddt": self.edit_ddt.text().strip() or None, "fornitore": self.edit_fornitore.text().strip() or None,
                     "note": self.edit_note.text().strip() or None, "id": self.id_mov
                 })
@@ -276,6 +454,14 @@ class DialogRegistroProdotto(QDialog):
 
         # --- ESTRAIAMO L'UNITÀ DI MISURA ASSOLUTA (es. da "kg/ha" a "kg") ---
         self.um_pulita = self.um.split('/')[0].strip() if '/' in self.um else self.um
+
+        # `unita_carico`: UM con cui l'utente inserisce i carichi manuali.
+        # I dialog di nuovo/modifica la useranno come unità di input e
+        # convertiranno in `um_pulita` (UM "interna" del registro) al salvataggio.
+        with self.engine.connect() as conn:
+            self.unita_carico = conn.execute(text(
+                "SELECT unita_carico FROM prodotti WHERE id = :pid"
+            ), {"pid": self.prodotto_id}).scalar()
 
         suffisso = " — Fittizio" if mostra_fittizio else ""
         titolo_filter = f" ({azienda_filter})" if azienda_filter else ""
@@ -355,7 +541,7 @@ class DialogRegistroProdotto(QDialog):
             FROM {self.tabella} rm
             LEFT JOIN aziende az_wh ON az_wh.id = rm.azienda_id
             LEFT JOIN aziende az_orig ON az_orig.id = rm.azienda_id_origine
-            WHERE rm.prodotto_id = {self.prodotto_id} {clausola_az}
+            WHERE rm.prodotto_id = :pid {clausola_az}
             ORDER BY rm.data_movimento DESC, rm.id DESC
         """
 
@@ -363,7 +549,7 @@ class DialogRegistroProdotto(QDialog):
         self.modello_registro = QStandardItemModel()
 
         with self.engine.connect() as conn:
-            result = conn.execute(text(query_sql))
+            result = conn.execute(text(query_sql), {"pid": self.prodotto_id})
             col_names = list(result.keys())
             self.modello_registro.setHorizontalHeaderLabels(col_names)
 
@@ -392,8 +578,11 @@ class DialogRegistroProdotto(QDialog):
         return DummyRecord(dati)
 
     def _nuovo_movimento(self):
-        # Passiamo l'unità pulita al form del nuovo movimento (così apparirà pulita anche di fianco al campo numerico)
-        if DialogNuovoMovimento(self.engine, self.prodotto_id, self.um_pulita, self).exec(): self.aggiorna_dati()
+        # `unita_carico` se definita guida l'UM di input nel dialog (con
+        # conversione automatica verso `um_pulita` al salvataggio).
+        if DialogNuovoMovimento(self.engine, self.prodotto_id, self.um_pulita,
+                                self, unita_carico=self.unita_carico).exec():
+            self.aggiorna_dati()
 
     def _modifica_movimento(self):
         idx = self.vista.currentIndex()
@@ -405,7 +594,9 @@ class DialogRegistroProdotto(QDialog):
             return
 
         dati = {"id": r.value("id"), "data": r.value("Data"), "tipo": r.value("Tipo"), "qta": float(r.value(f"Quantità ({self.um_pulita})")), "ddt": r.value("N. DDT"), "fornitore": r.value("Fornitore"), "note": r.value("Note"), "azienda_id": r.value("azienda_id")}
-        if DialogModificaMovimento(self.engine, dati, self.um_pulita, self).exec(): self.aggiorna_dati()
+        if DialogModificaMovimento(self.engine, dati, self.um_pulita,
+                                   self, unita_carico=self.unita_carico).exec():
+            self.aggiorna_dati()
 
     def _elimina_movimento(self):
         idx = self.vista.currentIndex()
@@ -715,11 +906,20 @@ class PannelloProdotti(PannelloBaseDialog):
         if DialogProdotto(self.engine, parent=self).exec(): self.aggiorna_dati()
 
     def apri_dialog_modifica(self, riga):
+        # `unita_carico` non viene esposto come colonna della tabella prodotti
+        # (vedi aggiorna_dati): lo leggiamo direttamente dal DB così il combo
+        # del dialog si apre con la selezione corretta.
+        prod_id = riga.value("id")
+        with self.engine.connect() as conn:
+            unita_carico = conn.execute(text(
+                "SELECT unita_carico FROM prodotti WHERE id = :pid"
+            ), {"pid": prod_id}).scalar()
         dati = {
-            "id": riga.value("id"), "nome_prodotto": riga.value("Nome Prodotto"), "categoria": riga.value("Categoria"),
+            "id": prod_id, "nome_prodotto": riga.value("Nome Prodotto"), "categoria": riga.value("Categoria"),
             "numero_registrazione": riga.value("N. Registrazione"), "sostanza_attiva": riga.value("Sostanza Attiva"),
             "bio_convenzionale": riga.value("Bio/Conv"), "blacklist": riga.value("Blacklist"), "avversita": riga.value("Avversità"),
-            "unita_misura": riga.value("Unità"), "titolo_n": riga.value("titolo_n"), "titolo_p": riga.value("titolo_p"), "titolo_k": riga.value("titolo_k"),
+            "unita_misura": riga.value("Unità"), "unita_carico": unita_carico,
+            "titolo_n": riga.value("titolo_n"), "titolo_p": riga.value("titolo_p"), "titolo_k": riga.value("titolo_k"),
             "phi_giorni": riga.value("phi_giorni"), "trattamenti_max": riga.value("trattamenti_max"), "intervallo_min_tratt": riga.value("intervallo_min_tratt"),
             "min_sostanza": riga.value("min_sostanza"), "max_sostanza": riga.value("max_sostanza"), "qta_acqua": riga.value("qta_acqua")
         }

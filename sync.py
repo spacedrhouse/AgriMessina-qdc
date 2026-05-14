@@ -91,6 +91,12 @@ def _upsert_tendoni(engine: Engine, items: list) -> None:
 def _upsert_prodotti(engine: Engine, items: list) -> None:
     if not items:
         return
+    # `unita_carico`: campo locale finché il backend non lo gestisce. Se gli
+    # items dal server non lo includono, .get() ritorna None e il COALESCE
+    # nell'UPSERT preserva il valore locale già impostato. Quando il backend
+    # supporterà il campo, il valore server prenderà il sopravvento.
+    for it in items:
+        it.setdefault("unita_carico", None)
     with engine.begin() as conn:
         # ON CONFLICT aggiorna senza cancellare l'ID: i trattamenti collegati
         # non vengono toccati. SQLAlchemy esegue executemany batchando.
@@ -100,13 +106,13 @@ def _upsert_prodotti(engine: Engine, items: list) -> None:
                 sostanza_attiva, bio_convenzionale, avversita,
                 titolo_n, titolo_p, titolo_k,
                 phi_giorni, trattamenti_max, intervallo_min_tratt,
-                unita_misura, min_sostanza, max_sostanza, qta_acqua, blacklist
+                unita_misura, unita_carico, min_sostanza, max_sostanza, qta_acqua, blacklist
             ) VALUES (
                 :id, :nome_prodotto, :categoria, :numero_registrazione,
                 :sostanza_attiva, :bio_convenzionale, :avversita,
                 :titolo_n, :titolo_p, :titolo_k,
                 :phi_giorni, :trattamenti_max, :intervallo_min_tratt,
-                :unita_misura, :min_sostanza, :max_sostanza, :qta_acqua, :blacklist
+                :unita_misura, :unita_carico, :min_sostanza, :max_sostanza, :qta_acqua, :blacklist
             )
             ON CONFLICT(id) DO UPDATE SET
                 nome_prodotto=excluded.nome_prodotto,
@@ -122,6 +128,7 @@ def _upsert_prodotti(engine: Engine, items: list) -> None:
                 trattamenti_max=excluded.trattamenti_max,
                 intervallo_min_tratt=excluded.intervallo_min_tratt,
                 unita_misura=excluded.unita_misura,
+                unita_carico=COALESCE(excluded.unita_carico, prodotti.unita_carico),
                 min_sostanza=excluded.min_sostanza,
                 max_sostanza=excluded.max_sostanza,
                 qta_acqua=excluded.qta_acqua,

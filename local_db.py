@@ -35,8 +35,22 @@ def get_engine() -> Engine:
 @event.listens_for(Engine, "connect")
 def _set_sqlite_pragma(dbapi_connection, connection_record):
     cursor = dbapi_connection.cursor()
-    cursor.execute("PRAGMA foreign_keys=ON")
-    cursor.close()
+    try:
+        cursor.execute("PRAGMA foreign_keys=ON")
+        # WAL: lettori non bloccano scritture e viceversa. Senza, una transazione
+        # lunga (sync_all, reconcile, ricalcolo magazzino) blocca i SELECT della
+        # UI fino al commit, producendo errori "database is locked" che oggi
+        # vengono solo loggati (vedi _check_and_sync). WAL è persistito sul DB
+        # quindi basta settarlo una volta.
+        cursor.execute("PRAGMA journal_mode=WAL")
+        # NORMAL: trade-off ragionevole su WAL (fsync solo al checkpoint, non
+        # ad ogni commit). FULL sarebbe più sicuro ma molto più lento.
+        cursor.execute("PRAGMA synchronous=NORMAL")
+        # 5s di attesa prima di sollevare "locked" su SELECT: copre i piccoli
+        # picchi di contesa senza far fallire la UI.
+        cursor.execute("PRAGMA busy_timeout=5000")
+    finally:
+        cursor.close()
 
 
 def init_local_database(engine: Engine) -> None:
@@ -72,6 +86,10 @@ def init_local_database(engine: Engine) -> None:
         )"""))
 
         # Prodotti
+        # `unita_carico`: UM con cui l'utente inserisce i carichi manuali a
+        # magazzino (es. "kg" anche se l'unità di misura del prodotto è "g/ha").
+        # Le opzioni dipendono dal numeratore di `unita_misura` e sono imposte
+        # dalla UI (mg/g/kg per massa, ml/l per volume, "Unità" per unità).
         conn.execute(text("""CREATE TABLE IF NOT EXISTS prodotti (
             id INTEGER PRIMARY KEY,
             nome_prodotto TEXT NOT NULL UNIQUE,
@@ -85,9 +103,17 @@ def init_local_database(engine: Engine) -> None:
             trattamenti_max INTEGER,
             intervallo_min_tratt INTEGER,
             unita_misura TEXT,
+            unita_carico TEXT,
             min_sostanza REAL, max_sostanza REAL, qta_acqua REAL,
             blacklist TEXT DEFAULT 'No'
         )"""))
+
+        # Migrazione idempotente: ALTER TABLE per DB pre-esistenti senza
+        # `unita_carico`. CREATE TABLE IF NOT EXISTS è no-op se la tabella c'è
+        # già, quindi serve ALTER esplicito.
+        cols_p = {r[1] for r in conn.execute(text("PRAGMA table_info(prodotti)")).fetchall()}
+        if "unita_carico" not in cols_p:
+            conn.execute(text("ALTER TABLE prodotti ADD COLUMN unita_carico TEXT"))
 
         # Trattamenti + dettagli
         conn.execute(text("""CREATE TABLE IF NOT EXISTS trattamenti (
@@ -258,8 +284,9 @@ def init_local_database(engine: Engine) -> None:
             "CREATE INDEX IF NOT EXISTS idx_t_isaut ON trattamenti(is_autorizzato)",
             "CREATE INDEX IF NOT EXISTS idx_t_data ON trattamenti(data_trattamento)",
             "CREATE INDEX IF NOT EXISTS idx_av_trat ON avvisi_trattamenti(trattamento_id)",
-            "CREATE INDEX IF NOT EXISTS idx_rm_trat ON registro_magazzino(trattamento_id)",
-            "CREATE INDEX IF NOT EXISTS idx_rm_prodotto ON registro_magazzino(prodotto_id)",
+            # idx_rm_trattamento e idx_rm_prodotto sono già creati sopra
+            # nella sezione CREATE TABLE registro_magazzino: senza questa
+            # nota, era facile aggiungere duplicati con nomi diversi.
             "CREATE INDEX IF NOT EXISTS idx_pend_entity ON pending_operations(entity_type, operation_type)",
             "CREATE INDEX IF NOT EXISTS idx_pend_entity_id ON pending_operations(entity_type, entity_id)",
             "CREATE INDEX IF NOT EXISTS idx_ten_contrada ON tendoni(contrada_id)",
@@ -427,6 +454,7 @@ def _install_triggers(conn) -> None:
                     'titolo_n', NEW.titolo_n, 'titolo_p', NEW.titolo_p, 'titolo_k', NEW.titolo_k,
                     'phi_giorni', NEW.phi_giorni, 'trattamenti_max', NEW.trattamenti_max,
                     'intervallo_min_tratt', NEW.intervallo_min_tratt, 'unita_misura', NEW.unita_misura,
+                    'unita_carico', NEW.unita_carico,
                     'min_sostanza', NEW.min_sostanza, 'max_sostanza', NEW.max_sostanza,
                     'qta_acqua', NEW.qta_acqua, 'blacklist', NEW.blacklist
                 ));
@@ -445,6 +473,7 @@ def _install_triggers(conn) -> None:
                     'titolo_n', NEW.titolo_n, 'titolo_p', NEW.titolo_p, 'titolo_k', NEW.titolo_k,
                     'phi_giorni', NEW.phi_giorni, 'trattamenti_max', NEW.trattamenti_max,
                     'intervallo_min_tratt', NEW.intervallo_min_tratt, 'unita_misura', NEW.unita_misura,
+                    'unita_carico', NEW.unita_carico,
                     'min_sostanza', NEW.min_sostanza, 'max_sostanza', NEW.max_sostanza,
                     'qta_acqua', NEW.qta_acqua, 'blacklist', NEW.blacklist
                 ));
@@ -571,7 +600,9 @@ def set_downloading(engine: Engine, on: bool) -> None:
 
 
 def is_downloading(engine: Engine) -> bool:
-    with engine.begin() as conn:
+    # engine.connect() invece di engine.begin(): è un read-only e non serve
+    # acquisire il lock di scrittura per un SELECT su una singola riga.
+    with engine.connect() as conn:
         row = conn.execute(text("SELECT value FROM _sync_flags WHERE key = 'downloading'")).first()
         return bool(row and row[0])
 

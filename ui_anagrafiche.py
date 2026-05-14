@@ -132,7 +132,7 @@ class PannelloAziende(PannelloBaseDialog):
         if DialogAzienda(self.engine, parent=self).exec(): self.aggiorna_dati()
 
     def apri_dialog_modifica(self, riga):
-        if DialogAzienda(self.engine, dati={"id": riga.value("id"), "nome": riga.value("nome")}, parent=self).exec(): self.aggiorna_dati()
+        if DialogAzienda(self.engine, azienda_id=riga.value("id"), nome_attuale=riga.value("nome"), parent=self).exec(): self.aggiorna_dati()
 
     def elimina_record(self, riga):
         if QMessageBox.question(self, "Conferma", f"Eliminare l'azienda «{riga.value('nome')}» e tutto ciò che le è collegato?") == QMessageBox.StandardButton.Yes:
@@ -221,7 +221,7 @@ class PannelloAgri(PannelloBaseDialog):
         if DialogAgro(self.engine, parent=self).exec(): self.aggiorna_dati()
 
     def apri_dialog_modifica(self, riga):
-        if DialogAgro(self.engine, dati={"id": riga.value("id"), "nome": riga.value("Agro"), "azienda_id": riga.value("azienda_id")}, parent=self).exec(): self.aggiorna_dati()
+        if DialogAgro(self.engine, agro_id=riga.value("id"), nome_attuale=riga.value("Agro"), az_id_attuale=riga.value("azienda_id"), parent=self).exec(): self.aggiorna_dati()
 
     def elimina_record(self, riga):
         if QMessageBox.question(self, "Conferma", f"Eliminare l'agro «{riga.value('Agro')}»?") == QMessageBox.StandardButton.Yes:
@@ -315,7 +315,7 @@ class PannelloContrade(PannelloBaseDialog):
         if DialogContrada(self.engine, parent=self).exec(): self.aggiorna_dati()
 
     def apri_dialog_modifica(self, riga):
-        if DialogContrada(self.engine, dati={"id": riga.value("id"), "nome": riga.value("Contrada"), "agro_id": riga.value("agro_id")}, parent=self).exec(): self.aggiorna_dati()
+        if DialogContrada(self.engine, contrada_id=riga.value("id"), nome_attuale=riga.value("Contrada"), agri_id_attuale=riga.value("agro_id"), parent=self).exec(): self.aggiorna_dati()
 
     def elimina_record(self, riga):
         if QMessageBox.question(self, "Conferma", f"Eliminare la contrada «{riga.value('Contrada')}»?") == QMessageBox.StandardButton.Yes:
@@ -512,8 +512,9 @@ class PannelloTendoni(PannelloBaseDialog):
             # VISTA ANALISI: Mostra i prodotti e le rimanenze
             prod_id = self.combo_filtro.currentData()
 
-            # Se prod_id è None ("Nessuna Selezione"), il filtro_sql è vuoto e calcola per TUTTI i prodotti
-            filtro_sql = f"WHERE tr.prodotto_id = {prod_id}" if prod_id else ""
+            # Il filtro per prodotto è applicato in linea dentro la query
+            # (inlined come AND aggiuntivo) per coesistere col filtro temporale
+            # su intervallo_min_tratt.
 
             # Per i prodotti /hl il volume d'acqua va calcolato dalle BOTTI
             # REALI (b_tot × 10 hl): è quel che l'operatore ha effettivamente
@@ -566,7 +567,11 @@ class PannelloTendoni(PannelloBaseDialog):
                     FROM dettaglio_trattamenti dt
                     JOIN trattamenti tr ON tr.id = dt.trattamento_id
                     JOIN prodotti p2 ON p2.id = tr.prodotto_id
-                    {filtro_sql}
+                    -- I trattamenti più vecchi di intervallo_min_tratt non contribuiscono
+                    -- più alla qta totale per tendone (restano comunque nello storico).
+                    WHERE (p2.intervallo_min_tratt IS NULL OR p2.intervallo_min_tratt <= 0
+                           OR julianday('now') - julianday(tr.data_trattamento) <= p2.intervallo_min_tratt)
+                    {("AND tr.prodotto_id = :prod_id" if prod_id else "")}
                     GROUP BY dt.tendone_id, tr.prodotto_id
                     HAVING SUM(dt.quantita_sostanza) > 0
                 ) sp ON sp.tendone_id = t.id
@@ -576,7 +581,8 @@ class PannelloTendoni(PannelloBaseDialog):
             # Con l'aggiunta della colonna "Prodotto", Stato_Dose slitta all'indice 9
             self.COLONNE_NASCOSTE = [0, 5, 9]
 
-        self.esegui_query(query, self.engine)
+        params = {"prod_id": int(prod_id)} if (self.modalita_analisi and prod_id) else None
+        self.esegui_query(query, self.engine, params)
         self._nascondi_colonne()
         self.vista.resizeColumnsToContents()
 

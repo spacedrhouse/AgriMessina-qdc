@@ -291,7 +291,14 @@ def upload_pending(api: ApiClient, engine: Engine, notifier=None) -> tuple[int, 
 
     for op in pending:
         et, ot, eid = op["entity_type"], op["operation_type"], op["entity_id"]
-        payload = json.loads(op["payload_json"]) if op.get("payload_json") else {}
+        try:
+            payload = json.loads(op["payload_json"]) if op.get("payload_json") else {}
+        except (json.JSONDecodeError, TypeError) as e:
+            # Payload corrotto: senza catch, JSONDecodeError (ValueError) non
+            # è in nessun except sotto e abortirebbe l'intero ciclo, bloccando
+            # tutte le pending op successive. Sposta in dead-letter e continua.
+            _move_to_dead_letter(engine, op, f"payload_json corrotto: {e}", notifier=notifier)
+            continue
 
         try:
             resp = _call_api(api, engine, op, payload)
@@ -352,7 +359,10 @@ def upload_pending(api: ApiClient, engine: Engine, notifier=None) -> tuple[int, 
             status = getattr(e, 'status_code', None)
             log.warning("Errore su op %s (%s/%s) status=%s: %s", op['id'], et, ot, status, e)
 
-            if status == 404 and ot in ("UPDATE", "DELETE"):
+            if status == 404 and ot in ("UPDATE", "DELETE", "REVOCA", "AUTORIZZA"):
+                # REVOCA/AUTORIZZA 404 = il trattamento non esiste più server-side:
+                # è come UPDATE/DELETE su record già rimosso, va pulito anche localmente
+                # invece di lasciarlo finire in dead-letter dopo retry inutili.
                 _handle_record_gone(engine, et, eid, ot, op["id"], notifier)
             elif ot == "INSERT" and status is not None and 400 <= status < 500:
                 _handle_insert_rejected(engine, et, eid, status, payload, op["id"], notifier)

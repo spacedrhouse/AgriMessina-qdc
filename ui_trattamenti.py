@@ -883,6 +883,11 @@ class SchedaOperazioni(QWidget):
                                 JOIN prodotti p2 ON p2.id = t2.prodotto_id
                                 JOIN tendoni ten2 ON ten2.id = dt2.tendone_id
                                 WHERE dt2.tendone_id = dt.tendone_id AND t2.prodotto_id = t.prodotto_id
+                                -- Esclude trattamenti "scaduti" (più vecchi di intervallo_min_tratt giorni):
+                                -- non vanno conteggiati nel cumulativo per tendone (evita falsi positivi
+                                -- di sovradose su trattamenti remoti nel tempo).
+                                AND (p2.intervallo_min_tratt IS NULL OR p2.intervallo_min_tratt <= 0
+                                     OR julianday('now') - julianday(t2.data_trattamento) <= p2.intervallo_min_tratt)
                                 {filtro_inner}
                                 GROUP BY p2.unita_misura, ten2.ettari
                             ) AS dose_cumulativa_storica,

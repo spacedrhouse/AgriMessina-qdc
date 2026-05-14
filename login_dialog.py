@@ -152,3 +152,16 @@ class LoginDialog(QDialog):
         self.btn_login.setEnabled(True)
         self.lbl_status.setText("")
         QMessageBox.critical(self, "Login fallito", msg)
+
+    def closeEvent(self, event):
+        # Se l'utente chiude mentre il login è in corso, il worker resterebbe
+        # vivo a emettere segnali su un dialog distrutto: blocca l'emit
+        # disconnettendo i signal, poi attende che il thread termini.
+        if self._worker is not None and self._worker.isRunning():
+            try:
+                self._worker.success.disconnect()
+                self._worker.error.disconnect()
+            except (TypeError, RuntimeError):
+                pass
+            self._worker.wait(2000)
+        super().closeEvent(event)

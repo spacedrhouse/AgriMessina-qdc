@@ -116,7 +116,12 @@ class FinestraPrincipale(QMainWindow):
             self.setGeometry(100, 100, 1400, 900)
 
         self.db = None
-        self._is_syncing = False  # Flag per evitare accavallamenti
+        # Counter (non bool): se una pull realtime termina mentre reconcile
+        # sta ancora girando, il vecchio flag bool veniva resettato a False e
+        # un tick autosync vedeva via libera, sovrapponendosi al reconcile.
+        # Con il counter ogni acquirente fa +1/-1 nel finally; `_is_syncing`
+        # è True finché c'è almeno un acquirente.
+        self._sync_depth = 0
         self._sync_state = "idle"
         self._pending_count = 0
 
@@ -369,6 +374,12 @@ class FinestraPrincipale(QMainWindow):
         if events_listener is not None and events_listener.isRunning():
             events_listener.stop()
             events_listener.wait(2000)
+        # Update checker: se è ancora in corso (connessione GitHub lenta),
+        # l'app può appendersi sul thread. Attendiamo brevemente.
+        update_worker = getattr(self, "_update_worker", None)
+        if update_worker is not None and update_worker.isRunning():
+            update_worker.quit()
+            update_worker.wait(1000)
         # Nascondi tray icon: senza, su alcuni DE resta "orfana" finché non
         # passi col mouse sopra.
         tray = getattr(self, "tray", None)
@@ -480,6 +491,13 @@ class FinestraPrincipale(QMainWindow):
             # Errore non bloccante (es. DB lockato 1s): log debug, no popup.
             log.debug("pending_count fallito: %s", e)
 
+    @property
+    def _is_syncing(self) -> bool:
+        """True se almeno un'operazione di sync è attualmente in corso. È un
+        counter sotto, non un bool, per supportare correttamente sync nested
+        o ravvicinati (es. SSE event durante reconcile)."""
+        return self._sync_depth > 0
+
     def _esegui_reconcile(self):
         """Allineamento automatico: scarica lo stato corrente dal server e
         sincronizza il DB locale (upsert + delete dei fantasmi).
@@ -496,7 +514,7 @@ class FinestraPrincipale(QMainWindow):
             return
 
         import time
-        self._is_syncing = True
+        self._sync_depth += 1
         self.notifier.state("syncing")
         try:
             result = reconcile_with_server(self.api, self.engine, notifier=self.notifier)
@@ -514,7 +532,7 @@ class FinestraPrincipale(QMainWindow):
             else:
                 msg_low = result.message.lower()
                 if "sessione scaduta" in msg_low or "sessione non valida" in msg_low:
-                    # _is_syncing viene resettato dal finally; non duplicare qui.
+                    # Il finally decrementa il counter; non duplicare qui.
                     self._handle_session_expired()
                     return
                 if "rete" in msg_low:
@@ -530,7 +548,7 @@ class FinestraPrincipale(QMainWindow):
             self.notifier.error(f"Reconcile fallita: {e}")
             self.notifier.state("error")
         finally:
-            self._is_syncing = False
+            self._sync_depth -= 1
             self._aggiorna_pending_count()
 
     def _next_autosync_interval(self) -> int:
@@ -584,7 +602,12 @@ class FinestraPrincipale(QMainWindow):
     def _pull_trattamenti_realtime(self):
         """Pull leggero dei trattamenti per quasi-real-time updates da altri
         client. Refresha la UI solo se sono arrivati cambiamenti."""
-        self._is_syncing = True
+        # Defer se un altro sync è già in corso: reconcile/_esegui_sync
+        # coprono comunque i dati. _on_server_event ha già una guardia
+        # upstream, ma replico qui per robustezza.
+        if self._is_syncing:
+            return
+        self._sync_depth += 1
         try:
             aggiunti, cancellati = pull_trattamenti(self.api, self.engine, notifier=self.notifier)
             if aggiunti or cancellati:
@@ -608,7 +631,7 @@ class FinestraPrincipale(QMainWindow):
                     self.notifier.state("idle")
         except NotAuthenticatedError:
             # Token JWT scaduto: niente più retry silenziosi, apri il dialog.
-            self._is_syncing = False
+            # Il finally decrementa il counter; non duplicare qui.
             self._handle_session_expired()
             return
         except NetworkError as e:
@@ -621,7 +644,7 @@ class FinestraPrincipale(QMainWindow):
         except Exception as e:
             log.warning("Pull errore: %s", e)
         finally:
-            self._is_syncing = False
+            self._sync_depth -= 1
 
     def _pull_movimenti_realtime(self):
         """Pull leggero del registro magazzino. Triggerato dall'evento SSE
@@ -629,7 +652,9 @@ class FinestraPrincipale(QMainWindow):
         un trattamento, il backend genera gli scarichi automatici via
         sincronizza_scarico. Senza questo pull dedicato gli scarichi
         nuovi apparivano sul desktop solo al reconcile a 30 min."""
-        self._is_syncing = True
+        if self._is_syncing:
+            return
+        self._sync_depth += 1
         try:
             aggiunti, cancellati = pull_movimenti(self.api, self.engine, notifier=self.notifier)
             if aggiunti or cancellati:
@@ -641,7 +666,7 @@ class FinestraPrincipale(QMainWindow):
                 self.notifier.online = True
                 self.notifier.state("idle")
         except NotAuthenticatedError:
-            self._is_syncing = False
+            # Il finally decrementa il counter; non duplicare qui.
             self._handle_session_expired()
             return
         except NetworkError as e:
@@ -651,11 +676,11 @@ class FinestraPrincipale(QMainWindow):
         except Exception as e:
             log.warning("Pull movimenti errore: %s", e)
         finally:
-            self._is_syncing = False
+            self._sync_depth -= 1
 
     def _esegui_sync(self, silenzioso=False):
         """Logica unificata di sincronizzazione (Upload + Download + Refresh Viste)."""
-        self._is_syncing = True
+        self._sync_depth += 1
         self.notifier.state("syncing")
         result = None
         try:
@@ -701,9 +726,9 @@ class FinestraPrincipale(QMainWindow):
             self.notifier.error(f"Sync fallito: {e}")
         finally:
             # Senza il finally, una qualsiasi exception dopo l'upload lasciava
-            # _is_syncing=True per sempre: i tick di _check_and_sync sarebbero
+            # _sync_depth>0 per sempre: i tick di _check_and_sync sarebbero
             # tornati subito e l'app restava in stato "syncing" fino al riavvio.
-            self._is_syncing = False
+            self._sync_depth -= 1
 
         if result is None:
             return
@@ -1002,6 +1027,53 @@ class FinestraPrincipale(QMainWindow):
 
 # ----------------------------- main -----------------------------------------
 
+def _acquire_singleton_lock():
+    """Acquisisce un lock esclusivo non bloccante su `~/.agrimessina/qdc.lock`.
+
+    Ritorna il file handle (da mantenere aperto per tutta la vita del processo,
+    altrimenti il lock viene rilasciato) oppure `None` se un'altra istanza
+    detiene già il lock. L'OS rilascia il lock automaticamente al termine del
+    processo, anche per crash, quindi non resta mai uno stale lock.
+
+    Senza questo controllo, due istanze dello stesso utente sullo stesso DB
+    SQLite si pestano sul flag `_sync_flags.downloading`: la #2 può azzerarlo
+    mentre la #1 sta scaricando, e i trigger ricominciano ad accodare i record
+    "scaricati" creando duplicati lato server.
+    """
+    from pathlib import Path
+    try:
+        lock_path = Path.home() / ".agrimessina" / "qdc.lock"
+        lock_path.parent.mkdir(parents=True, exist_ok=True)
+        fh = open(lock_path, "w")
+    except OSError as e:
+        log.warning("Impossibile creare il file di lock: %s. Skipping singleton check.", e)
+        return None
+
+    try:
+        if os.name == "nt":
+            import msvcrt
+            # locking() lavora su un byte range: posizionamento esplicito a 0.
+            fh.seek(0)
+            msvcrt.locking(fh.fileno(), msvcrt.LK_NBLCK, 1)
+        else:
+            import fcntl
+            fcntl.flock(fh.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except (OSError, IOError):
+        fh.close()
+        return None
+
+    # PID scritto per debug: aprendo il file un dev può vedere quale istanza
+    # è viva. Truncate per pulire eventuali PID stale di run precedenti.
+    try:
+        fh.seek(0)
+        fh.truncate()
+        fh.write(str(os.getpid()))
+        fh.flush()
+    except OSError:
+        pass
+    return fh
+
+
 def run():
     setup_logging()
     log.info("=== Avvio AgriMessina QDC ===")
@@ -1011,6 +1083,21 @@ def run():
     setup_crash_reporter()
 
     app = QApplication(sys.argv)
+
+    # Singleton lock: se un'altra istanza è già viva, esce con dialog.
+    # Va fatto DOPO QApplication (serve un'app per il QMessageBox) ma PRIMA
+    # di toccare il DB locale.
+    lock_handle = _acquire_singleton_lock()
+    if lock_handle is None:
+        QMessageBox.critical(
+            None, "AgriMessina già in esecuzione",
+            "Un'altra istanza di AgriMessina è già aperta su questo computer.\n\n"
+            "Apri quella finestra oppure chiudila prima di avviarne una nuova.",
+        )
+        log.warning("Avvio bloccato: lock singleton già detenuto da altra istanza")
+        sys.exit(1)
+    # Riferimento sulla app: senza, il GC chiude il file e rilascia il lock.
+    app._singleton_lock = lock_handle  # noqa: SLF001
 
     # --- AGGIUNGI QUESTA RIGA ---
     # Imposta l'icona globale a livello di applicazione (fondamentale per la taskbar di Windows)
