@@ -196,6 +196,24 @@ def _upsert_trattamenti(engine: Engine, items: list) -> None:
                     # Dettagli: ricreati ad ogni upsert (sostituzione completa).
                     # registro_magazzino NON ha FK verso dettaglio_trattamenti,
                     # quindi questo DELETE è safe.
+                    #
+                    # `bilanciamento_group_id` è metadata locale (il server non lo
+                    # conosce): prima del DELETE memorizziamo le associazioni
+                    # esistenti per (tendone_id, qta, is_bil) e le riapplichiamo
+                    # ai nuovi dt. Senza questa salvaguardia, un resync azzera
+                    # il group_id e l'eventuale rollback del sub-bilanciamento
+                    # degrada a parziale (dt negativi sui source non più
+                    # identificabili).
+                    group_map: dict[tuple, int] = {}
+                    for r in conn.execute(text(
+                        "SELECT tendone_id, quantita_sostanza, "
+                        "COALESCE(is_bilanciamento, 0), bilanciamento_group_id "
+                        "FROM dettaglio_trattamenti WHERE trattamento_id = :tid"
+                    ), {"tid": tid}).fetchall():
+                        if r[3] is not None:
+                            group_map[(r[0], round(float(r[1] or 0), 6),
+                                       int(r[2] or 0))] = int(r[3])
+
                     conn.execute(text(
                         "DELETE FROM dettaglio_trattamenti WHERE trattamento_id = :tid"
                     ), {"tid": tid})
@@ -216,6 +234,25 @@ def _upsert_trattamenti(engine: Engine, items: list) -> None:
                             }
                             for d in dettagli
                         ])
+                        # Riapplica i group_id memorizzati ai dt appena inseriti.
+                        for d in dettagli:
+                            key = (d.get("tendone_id"),
+                                   round(float(d.get("quantita_sostanza") or 0), 6),
+                                   int(d.get("is_bilanciamento") or 0))
+                            gid = group_map.get(key)
+                            if gid is not None:
+                                conn.execute(text("""
+                                    UPDATE dettaglio_trattamenti
+                                    SET bilanciamento_group_id = :gid
+                                    WHERE trattamento_id = :tid
+                                      AND tendone_id = :te
+                                      AND quantita_sostanza = :q
+                                      AND COALESCE(is_bilanciamento, 0) = :ib
+                                      AND bilanciamento_group_id IS NULL
+                                """), {"gid": gid, "tid": tid,
+                                       "te": d.get("tendone_id"),
+                                       "q": d.get("quantita_sostanza", 0),
+                                       "ib": int(d.get("is_bilanciamento") or 0)})
             except IntegrityError as e:
                 log.warning("Scartato Trattamento corrotto dal server (ID %s): %s", tid, e)
 

@@ -477,14 +477,6 @@ class DialogCompensaDisavanzo(QDialog):
             operatore_val = f"{operatore_base} [{src_tratt_id_nominal}]"
 
             with self.engine.begin() as conn:
-                src_tratt_ids_modificati = []
-                for src_tratt_id, quota, _ in quote:
-                    conn.execute(text("""
-                        INSERT INTO dettaglio_trattamenti (trattamento_id, tendone_id, quantita_sostanza, botti, is_bilanciamento)
-                        VALUES (:tr, :te, :q, 0, 1)
-                    """), {"tr": src_tratt_id, "te": self.tendone_origine_id, "q": -quota})
-                    src_tratt_ids_modificati.append(src_tratt_id)
-
                 tratt_dest_was_new = False
                 # Se la testata destinazione esiste già, il bilanciamento NON apporta nuove botti
                 botti_dest = 0.0
@@ -507,10 +499,30 @@ class DialogCompensaDisavanzo(QDialog):
                     # Botti calcolate solo se creiamo una testata completamente nuova
                     botti_dest = _botti_stimate(dati['ettari'])
 
+                # `bilanciamento_group_id` lega i dt del bilanciamento (negativi
+                # sui source + positivo sul dest) al sub di destinazione SOLO
+                # quando il dest è una testata nuova (caso "sub-puro"). In quel
+                # caso l'annullamento può rimuovere tutti i dt del gruppo senza
+                # lasciare traccia. Se il dest è preesistente non popoliamo il
+                # group_id: l'eventuale rollback è il caso "revisionato vero"
+                # (UPDATE is_autorizzato=0 + delete dei soli dt bil sul target,
+                # con i negativi sui source che restano come traccia contabile).
+                group_id = tratt_id_dest if tratt_dest_was_new else None
+
+                src_tratt_ids_modificati = []
+                for src_tratt_id, quota, _ in quote:
+                    conn.execute(text("""
+                        INSERT INTO dettaglio_trattamenti (trattamento_id, tendone_id, quantita_sostanza, botti, is_bilanciamento, bilanciamento_group_id)
+                        VALUES (:tr, :te, :q, 0, 1, :gid)
+                    """), {"tr": src_tratt_id, "te": self.tendone_origine_id,
+                           "q": -quota, "gid": group_id})
+                    src_tratt_ids_modificati.append(src_tratt_id)
+
                 conn.execute(text("""
-                    INSERT INTO dettaglio_trattamenti (trattamento_id, tendone_id, quantita_sostanza, botti, is_bilanciamento)
-                    VALUES (:tr, :te, :q, :b, 1)
-                """), {"tr": tratt_id_dest, "te": dati['id'], "q": qta_effettiva, "b": botti_dest})
+                    INSERT INTO dettaglio_trattamenti (trattamento_id, tendone_id, quantita_sostanza, botti, is_bilanciamento, bilanciamento_group_id)
+                    VALUES (:tr, :te, :q, :b, 1, :gid)
+                """), {"tr": tratt_id_dest, "te": dati['id'], "q": qta_effettiva,
+                       "b": botti_dest, "gid": group_id})
 
             # Aggiorna scarico FITTIZIO per i trattamenti coinvolti. Per
             # contratto il bilanciamento si applica solo a trattamenti
@@ -598,6 +610,35 @@ class DialogCompensaSottodose(QDialog):
             self.p_int_min = conn.execute(text(
                 "SELECT intervallo_min_tratt FROM prodotti WHERE id = :pid"
             ), {"pid": self.prodotto_id}).scalar()
+            # Identifica il trattamento "target" sul tendone (stesso criterio
+            # del check n_revisionati: revisionato vero O sub-bilanciamento
+            # puro). Serve sia per la Strategia C sia per personalizzare il
+            # messaggio dell'UI (un sub-puro non torna nello Storico — viene
+            # cancellato senza lasciare traccia).
+            target_row = conn.execute(text("""
+                SELECT tr.id,
+                       (SELECT MIN(COALESCE(dt2.is_bilanciamento, 0))
+                        FROM dettaglio_trattamenti dt2
+                        WHERE dt2.trattamento_id = tr.id) AS all_bil
+                FROM trattamenti tr
+                JOIN dettaglio_trattamenti dt ON dt.trattamento_id = tr.id
+                WHERE tr.prodotto_id = :pid AND dt.tendone_id = :tid
+                  AND (
+                    tr.is_autorizzato = 1
+                    OR (SELECT MIN(COALESCE(dt2.is_bilanciamento, 0))
+                        FROM dettaglio_trattamenti dt2
+                        WHERE dt2.trattamento_id = tr.id) = 1
+                  )
+                GROUP BY tr.id
+                ORDER BY tr.data_trattamento DESC, tr.id DESC
+                LIMIT 1
+            """), {"pid": self.prodotto_id, "tid": self.tendone_id}).fetchone()
+            if target_row:
+                self._target_tratt_id = int(target_row[0])
+                self._target_is_sub_puro = bool(target_row[1])
+            else:
+                self._target_tratt_id = None
+                self._target_is_sub_puro = False
 
         self.setWindowTitle(f"Bilancia Sottodosaggio — {nome_prodotto}")
         self.setMinimumWidth(750)
@@ -992,17 +1033,33 @@ class DialogCompensaSottodose(QDialog):
             layout.addWidget(QLabel(
                 "<b>Nessun tendone candidato per uno spostamento.</b>"
             ))
-            layout.addWidget(QLabel(
-                "Strategia di ultima istanza: <b>annulla la revisione</b>. Il "
-                "trattamento torna nello Storico come proposta e la quantità "
-                f"di <b>{self.qta_tot_target:.4f} {self.um.split('/')[0]}</b> "
-                "torna disponibile nel magazzino fittizio."
-            ))
+            um_simple = self.um.split('/')[0]
+            if self._target_is_sub_puro:
+                # Sub-bilanciamento puro: non è una proposta promossa a
+                # revisionato — è una testata creata ad-hoc per ricevere
+                # carico da altri trattamenti. L'annullamento cancella il
+                # sub e i dt negativi gemelli sui source: nessuna traccia.
+                testo_strategia = (
+                    "Strategia di ultima istanza: <b>annulla il bilanciamento</b>. "
+                    "Il sub-trattamento viene rimosso e la quantità di "
+                    f"<b>{self.qta_tot_target:.4f} {um_simple}</b> torna ai "
+                    "trattamenti source. Nessuna traccia contabile sui source."
+                )
+                testo_btn = "↩️ Annulla Bilanciamento"
+            else:
+                testo_strategia = (
+                    "Strategia di ultima istanza: <b>annulla la revisione</b>. Il "
+                    "trattamento torna nello Storico come proposta e la quantità "
+                    f"di <b>{self.qta_tot_target:.4f} {um_simple}</b> "
+                    "torna disponibile nel magazzino fittizio."
+                )
+                testo_btn = "↩️ Annulla Revisione"
+            layout.addWidget(QLabel(testo_strategia))
             btns = QHBoxLayout()
             btns.addStretch()
             btn_annulla = QPushButton("Annulla")
             btn_annulla.clicked.connect(self.reject)
-            btn_cancella = QPushButton("↩️ Annulla Revisione")
+            btn_cancella = QPushButton(testo_btn)
             btn_cancella.setProperty("class", "warning")
             btn_cancella.clicked.connect(self._cancella_trattamento_target)
             btns.addWidget(btn_annulla)
@@ -1164,94 +1221,171 @@ class DialogCompensaSottodose(QDialog):
     # ────────────────────────────────────────────────────────────────
 
     def _cancella_trattamento_target(self):
-        """Strategia C: annulla la revisione del trattamento target.
+        """Strategia C: annulla la revisione (o il bilanciamento) sul target.
 
-        Il trattamento NON viene cancellato: torna nello Storico come
-        proposta (is_autorizzato=1 → 0) e la sua qta è di nuovo disponibile
-        nel magazzino fittizio. Senza, il DELETE rimuoveva l'unica riga
-        di `trattamenti` e quindi la proposta originale spariva insieme
-        alla revisione, contrariamente alle aspettative dell'utente.
+        Due rami a seconda della natura del target:
 
-        Gli altri trattamenti collegati (source originali o altri sub) NON
-        vengono toccati in alcun modo: i loro dt restano invariati e il
-        loro magazzino fittizio NON viene ricalcolato. È una scelta
-        consapevole: il bilanciamento è "annullato" lato target, ma le
-        contropartite contabili sui source restano come traccia.
+        - **Sub-bilanciamento puro** (tutti i dt is_bilanciamento=1): il
+          trattamento non è una proposta promossa, è una testata creata
+          ad-hoc da `DialogCompensaDisavanzo`. Annullare significa
+          eliminare il sub E i dt negativi gemelli inseriti sui source —
+          il prodotto torna effettivamente disponibile sui source senza
+          lasciare traccia contabile. Il legame target↔dt-source è dato
+          dalla colonna `bilanciamento_group_id` (= id del sub).
 
-        I dt di bilanciamento (is_bilanciamento=1) ricevuti dal target
-        durante la revisione che stiamo annullando vengono rimossi: erano
-        carichi virtuali validi solo nel contesto della revisione, e
-        lasciarli farebbe ricomparire la qta bilanciata se l'utente
-        ri-revisiona.
+        - **Revisionato vero** (is_autorizzato=1 con almeno un dt
+          is_bilanciamento=0): è una proposta promossa che vogliamo
+          rimandare allo Storico. UPDATE is_autorizzato=1→0 + DELETE dei
+          soli dt is_bilanciamento=1 sul target. I dt negativi sui source
+          restano come traccia contabile (scelta consapevole: il
+          bilanciamento è annullato lato target, contropartite sui source
+          rimangono — l'utente può comunque annullarle col pulsante
+          "Annulla Bilanciamento" sul prodotto).
 
-        Reale: non toccato in nessun caso (snapshot congelato).
+        Reale: mai toccato in nessun caso (snapshot congelato).
         """
-        risposta = QMessageBox.question(
-            self, "Annulla Revisione",
-            f"Confermi l'annullamento della revisione del trattamento di "
-            f"<b>{self.nome_prodotto}</b> su questo tendone?<br><br>"
-            f"Il trattamento tornerà nello <b>Storico</b> come proposta. "
-            f"La quantità di <b>{self.qta_tot_target:.4f} "
-            f"{self.um.split('/')[0]}</b> tornerà disponibile nel magazzino "
-            f"fittizio. Il magazzino reale e gli altri trattamenti collegati "
-            f"non vengono toccati.",
-            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
-            QMessageBox.StandardButton.No,
-        )
+        if not self._target_tratt_id:
+            QMessageBox.critical(self, "Errore",
+                                 "Trattamento target non trovato.")
+            return
+
+        um_simple = self.um.split('/')[0]
+        if self._target_is_sub_puro:
+            risposta = QMessageBox.question(
+                self, "Annulla Bilanciamento",
+                f"Confermi l'annullamento del sub-bilanciamento di "
+                f"<b>{self.nome_prodotto}</b> su questo tendone?<br><br>"
+                f"Il sub-trattamento verrà <b>rimosso</b> e la quantità di "
+                f"<b>{self.qta_tot_target:.4f} {um_simple}</b> tornerà ai "
+                f"trattamenti source. Nessuna traccia contabile verrà "
+                f"lasciata sui source.",
+                QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+                QMessageBox.StandardButton.No,
+            )
+        else:
+            risposta = QMessageBox.question(
+                self, "Annulla Revisione",
+                f"Confermi l'annullamento della revisione del trattamento di "
+                f"<b>{self.nome_prodotto}</b> su questo tendone?<br><br>"
+                f"Il trattamento tornerà nello <b>Storico</b> come proposta. "
+                f"La quantità di <b>{self.qta_tot_target:.4f} {um_simple}</b> "
+                f"tornerà disponibile nel magazzino fittizio. Il magazzino "
+                f"reale e gli altri trattamenti collegati non vengono toccati.",
+                QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+                QMessageBox.StandardButton.No,
+            )
         if risposta != QMessageBox.StandardButton.Yes:
             return
 
+        target_tratt_id = self._target_tratt_id
         try:
-            with self.engine.begin() as conn:
-                target_tratt_id = conn.execute(text("""
-                    SELECT tr.id FROM trattamenti tr
-                    JOIN dettaglio_trattamenti dt ON dt.trattamento_id = tr.id
-                    WHERE tr.prodotto_id = :pid AND dt.tendone_id = :tid
-                      AND tr.is_autorizzato = 1
-                    ORDER BY tr.data_trattamento DESC, tr.id DESC
-                    LIMIT 1
-                """), {"pid": self.prodotto_id, "tid": self.tendone_id}).scalar()
+            source_ids_toccati: list[int] = []
+            if self._target_is_sub_puro:
+                with self.engine.begin() as conn:
+                    # Recupera i trattamenti source legati a questo sub via
+                    # bilanciamento_group_id. Esclude il sub stesso. Se il
+                    # sub è legacy (pre-migration v4) group_id è NULL: in
+                    # quel caso source_ids resta vuoto e degradiamo a un
+                    # DELETE del solo sub (i dt negativi sui source restano
+                    # come traccia — informazione persa, non recuperabile).
+                    source_ids_toccati = [int(r[0]) for r in conn.execute(text("""
+                        SELECT DISTINCT trattamento_id
+                        FROM dettaglio_trattamenti
+                        WHERE bilanciamento_group_id = :gid
+                          AND trattamento_id != :gid
+                    """), {"gid": target_tratt_id}).fetchall()]
 
-                if not target_tratt_id:
-                    QMessageBox.critical(self, "Errore",
-                                         "Trattamento revisionato non trovato.")
-                    return
+                    # Cancella tutti i dt del gruppo (positivo sul sub +
+                    # negativi sui source). Lo scarico fittizio del sub e
+                    # dei source toccati va ricalcolato dopo.
+                    conn.execute(text(
+                        "DELETE FROM dettaglio_trattamenti "
+                        "WHERE bilanciamento_group_id = :gid"
+                    ), {"gid": target_tratt_id})
 
-                # Cancella scarico fittizio del target (reale: congelato).
-                cancella_scarico_fittizio(conn, target_tratt_id)
+                    # Avvisi del sub: rimossi (verranno ricalcolati). Avvisi
+                    # dei source: invariati qui, vengono ricomputati da
+                    # ricalcola_avvisi_globali a fine transazione.
+                    conn.execute(text(
+                        "DELETE FROM avvisi_trattamenti WHERE trattamento_id = :id"
+                    ), {"id": target_tratt_id})
 
-                # Rimuovi SOLO i dt di bilanciamento (carichi ricevuti durante
-                # la revisione). I dt originali della proposta (bil=0) restano.
-                conn.execute(text(
-                    "DELETE FROM dettaglio_trattamenti "
-                    "WHERE trattamento_id = :id AND is_bilanciamento = 1"
-                ), {"id": target_tratt_id})
+                    # Cancella il fittizio del sub (sta per essere DROPpato).
+                    cancella_scarico_fittizio(conn, target_tratt_id)
 
-                # Avvisi rimossi qui per UI immediata; vengono ricalcolati
-                # subito dopo da ricalcola_avvisi_globali e dal server.
-                conn.execute(text(
-                    "DELETE FROM avvisi_trattamenti WHERE trattamento_id = :id"
-                ), {"id": target_tratt_id})
+                    # DELETE della testata sub. ON DELETE CASCADE elimina
+                    # anche eventuali dt residui (non dovrebbero essercene).
+                    conn.execute(text(
+                        "DELETE FROM trattamenti WHERE id = :id"
+                    ), {"id": target_tratt_id})
 
-                # REVOCA della revisione: 1 → 0. Niente DELETE della testata,
-                # altrimenti spariva anche dallo Storico.
-                conn.execute(text(
-                    "UPDATE trattamenti SET is_autorizzato = 0 WHERE id = :id"
-                ), {"id": target_tratt_id})
+                    # Ricalcola il fittizio per ogni source toccato: i dt
+                    # negativi sono spariti, quindi la quantità "tornata"
+                    # ai source si riflette nel loro magazzino fittizio.
+                    for sid in source_ids_toccati:
+                        scarica_fittizio(conn, sid)
+            else:
+                with self.engine.begin() as conn:
+                    # Cancella scarico fittizio del target (reale: congelato).
+                    cancella_scarico_fittizio(conn, target_tratt_id)
 
-            # Backend: notifica la revoca (endpoint /trattamenti/{id}/revoca).
-            enqueue_operation(self.engine, "TRATTAMENTO", "REVOCA",
-                              entity_id=target_tratt_id)
+                    # Rimuovi SOLO i dt di bilanciamento ricevuti dal target.
+                    # I dt originali della proposta (bil=0) restano.
+                    conn.execute(text(
+                        "DELETE FROM dettaglio_trattamenti "
+                        "WHERE trattamento_id = :id AND is_bilanciamento = 1"
+                    ), {"id": target_tratt_id})
+
+                    conn.execute(text(
+                        "DELETE FROM avvisi_trattamenti WHERE trattamento_id = :id"
+                    ), {"id": target_tratt_id})
+
+                    # REVOCA: 1 → 0. Niente DELETE della testata, altrimenti
+                    # spariva anche dallo Storico.
+                    conn.execute(text(
+                        "UPDATE trattamenti SET is_autorizzato = 0 WHERE id = :id"
+                    ), {"id": target_tratt_id})
+
+            # Backend ops
+            if self._target_is_sub_puro:
+                enqueue_operation(self.engine, "TRATTAMENTO", "DELETE",
+                                  entity_id=target_tratt_id)
+                for sid in source_ids_toccati:
+                    payload = _build_trattamento_payload(self.engine, sid)
+                    if payload:
+                        enqueue_operation(self.engine, "TRATTAMENTO", "UPDATE",
+                                          entity_id=sid, payload=payload)
+            else:
+                enqueue_operation(self.engine, "TRATTAMENTO", "REVOCA",
+                                  entity_id=target_tratt_id)
+
             ricalcola_avvisi_globali(self.engine)
-
             self.accept()
-            QMessageBox.information(
-                self, "Revisione annullata",
-                "La revisione è stata annullata. Il trattamento è di nuovo "
-                "nello Storico e il prodotto è disponibile nel magazzino "
-                "fittizio. Gli altri trattamenti collegati non sono stati "
-                "modificati.",
-            )
+            if self._target_is_sub_puro:
+                if source_ids_toccati:
+                    QMessageBox.information(
+                        self, "Bilanciamento annullato",
+                        "Il sub-trattamento è stato rimosso e la quantità è "
+                        "tornata ai trattamenti source. Nessuna traccia "
+                        "contabile è stata lasciata.",
+                    )
+                else:
+                    # Sub legacy senza group_id: rollback parziale.
+                    QMessageBox.warning(
+                        self, "Bilanciamento annullato (parziale)",
+                        "Il sub-trattamento è stato rimosso, ma i dt negativi "
+                        "sui trattamenti source non sono stati identificati "
+                        "(bilanciamento creato prima dell'introduzione del "
+                        "tracking). Restano come traccia contabile sui source.",
+                    )
+            else:
+                QMessageBox.information(
+                    self, "Revisione annullata",
+                    "La revisione è stata annullata. Il trattamento è di nuovo "
+                    "nello Storico e il prodotto è disponibile nel magazzino "
+                    "fittizio. Gli altri trattamenti collegati non sono stati "
+                    "modificati.",
+                )
         except Exception as e:
             QMessageBox.critical(self, "Errore", f"Operazione fallita:\n{str(e)}")
 

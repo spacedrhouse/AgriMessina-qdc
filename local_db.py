@@ -134,7 +134,8 @@ def init_local_database(engine: Engine) -> None:
             quantita_sostanza REAL NOT NULL,
             botti REAL,
             dose_ha REAL,
-            is_bilanciamento INTEGER DEFAULT 0
+            is_bilanciamento INTEGER DEFAULT 0,
+            bilanciamento_group_id INTEGER
         )"""))
 
         # Magazzino con integrità totale (Cancellazione e Aggiornamento a catena)

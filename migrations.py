@@ -115,8 +115,29 @@ def _migrate_v3(conn) -> None:
         log.info("[migration v3] is_autorizzato=1 su %d figli bilanciamento", n)
 
 
+def _migrate_v4(conn) -> None:
+    """Aggiunge `bilanciamento_group_id` su dettaglio_trattamenti.
+
+    Lega ogni dt di bilanciamento (positivo sul sub-trattamento, negativi
+    sui source) al sub di destinazione. Senza questo riferimento esplicito
+    non è possibile, in fase di annullamento di un sub in sottodose,
+    cancellare anche i dt negativi gemelli sui source: il prodotto
+    resterebbe "in traccia" come bilanciamento contabile.
+    """
+    cols = {row[1] for row in conn.execute(
+        text("PRAGMA table_info(dettaglio_trattamenti)")
+    ).fetchall()}
+    if "bilanciamento_group_id" not in cols:
+        conn.execute(text(
+            "ALTER TABLE dettaglio_trattamenti "
+            "ADD COLUMN bilanciamento_group_id INTEGER"
+        ))
+        log.info("[migration v4] aggiunta colonna bilanciamento_group_id")
+
+
 MIGRATIONS: list[tuple[int, Callable]] = [
     (3, _migrate_v3),
+    (4, _migrate_v4),
 ]
 
 
