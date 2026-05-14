@@ -30,7 +30,27 @@ from PyQt6.QtGui import QStandardItemModel, QStandardItem, QColor
 from config import CONFIG
 from database import ricalcola_avvisi_globali
 from local_db import enqueue_operation
+from magazzino_logic import (
+    scarica_reale,
+    scarica_fittizio,
+    cancella_scarico_reale,
+    cancella_scarico_fittizio,
+)
 from trattamenti_payload import build_trattamento_payload as _build_trattamento_payload
+
+
+def _botti_stimate(ettari: float) -> float:
+    """Numero di botti previsto per un trattamento futuro su `ettari`.
+
+    Convenzione AgriMessina: minimo 1 botte, poi 0.5 botti ogni 0.5 ettari
+    arrotondati per eccesso. È la stessa formula che il salvataggio del
+    bilanciamento applica quando crea una testata nuova su un tendone
+    vuoto: deve restare coerente in TUTTI i punti che fanno preview di
+    dose finale o calcolano min/max consentito su target senza botti
+    registrate. Se preview e salva divergono, l'utente accetta un
+    bilanciamento che poi finisce sotto/sopra la soglia.
+    """
+    return max(1.0, math.ceil(ettari * 2) / 2.0)
 
 
 class DialogCompensaDisavanzo(QDialog):
@@ -165,8 +185,12 @@ class DialogCompensaDisavanzo(QDialog):
                     if (oggi - d_u).days < p_int_min:
                         continue
 
-                # Calcolo Spazio esatto
-                botti_calc = net_botti if net_botti > 0 else t_ettari
+                # Calcolo Spazio esatto. Per tendoni vuoti (net_botti=0)
+                # la stima delle botti segue la convenzione AgriMessina
+                # (vedi _botti_stimate). Usare semplicemente t_ettari
+                # falsa il calcolo dello spazio in /hl (es. 2.27 ha=2.5
+                # botti=25 hl, non 22.7 hl).
+                botti_calc = net_botti if net_botti > 0 else _botti_stimate(t_ettari)
                 if '/hl' in self.um:
                     max_consentito = self.max_s * botti_calc * 10.0
                 else:
@@ -386,7 +410,8 @@ class DialogCompensaDisavanzo(QDialog):
                 """), {"tid": dati['id'], "pid": self.prodotto_id}).fetchone()
 
                 net_qty, net_botti = float(check[0]), float(check[1])
-                botti_calc = net_botti if net_botti > 0 else dati['ettari']
+                # Stima botti per tendoni vuoti (vedi _botti_stimate).
+                botti_calc = net_botti if net_botti > 0 else _botti_stimate(dati['ettari'])
 
                 if '/hl' in self.um:
                     max_cons = self.max_s * botti_calc * 10.0
@@ -438,16 +463,36 @@ class DialogCompensaDisavanzo(QDialog):
                 botti_dest = 0.0
 
                 if not tratt_id_dest:
-                    res = conn.execute(text("INSERT INTO trattamenti (data_trattamento, data_inserimento, prodotto_id, operatore, tipo_trattamento) VALUES (:d, :di, :p, :op, 'Difesa')"), {"d": datetime.now().date(), "di": datetime.now().strftime("%Y-%m-%d %H:%M:%S"), "p": self.prodotto_id, "op": operatore_val})
+                    # Il dest nasce già REVISIONATO (is_autorizzato=1): il
+                    # bilanciamento per regola si applica solo su trattamenti
+                    # revisionati, quindi il "figlio" eredita lo stato. Senza
+                    # questo, un sub-bilanciamento in sottodose non sarebbe
+                    # bilanciabile a sua volta ("trattamento solo in Storico").
+                    res = conn.execute(text(
+                        "INSERT INTO trattamenti (data_trattamento, data_inserimento, "
+                        "prodotto_id, operatore, tipo_trattamento, is_autorizzato) "
+                        "VALUES (:d, :di, :p, :op, 'Difesa', 1)"
+                    ), {"d": datetime.now().date(),
+                        "di": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+                        "p": self.prodotto_id, "op": operatore_val})
                     tratt_id_dest = res.lastrowid
                     tratt_dest_was_new = True
                     # Botti calcolate solo se creiamo una testata completamente nuova
-                    botti_dest = max(1.0, math.ceil(dati['ettari'] * 2) / 2.0)
+                    botti_dest = _botti_stimate(dati['ettari'])
 
                 conn.execute(text("""
                     INSERT INTO dettaglio_trattamenti (trattamento_id, tendone_id, quantita_sostanza, botti, is_bilanciamento)
                     VALUES (:tr, :te, :q, :b, 1)
                 """), {"tr": tratt_id_dest, "te": dati['id'], "q": qta_effettiva, "b": botti_dest})
+
+            # Aggiorna scarico FITTIZIO per i trattamenti coinvolti. Per
+            # contratto il bilanciamento si applica solo a trattamenti
+            # revisionati (vedi _apri_compensazione che blocca lo Storico),
+            # quindi tocchiamo solo il fittizio: il reale è congelato.
+            with self.engine.begin() as conn:
+                for src_tratt_id in src_tratt_ids_modificati:
+                    scarica_fittizio(conn, src_tratt_id)
+                scarica_fittizio(conn, tratt_id_dest)
 
             # Backend Ops
             for src_tratt_id in src_tratt_ids_modificati:
@@ -467,6 +512,674 @@ class DialogCompensaDisavanzo(QDialog):
         except Exception as e:
             # Rollback UI: ricarica i target per riallineare lo stato.
             self._carica_target()
+            QMessageBox.critical(self, "Errore", f"Operazione fallita:\n{str(e)}")
+
+
+class DialogCompensaSottodose(QDialog):
+    """Bilanciamento per trattamenti in sottodose (dose < min etichetta).
+
+    Due strategie:
+
+    A. PRELIEVO da altri trattamenti revisionati (default)
+       - Candidati: trattamenti is_autorizzato=1 dello stesso prodotto con
+         margine prelevabile = qta_attuale - min × volume_acqua_source > 0.
+       - L'utente sceglie quanto prelevare da ogni candidato.
+       - Salva: INSERT dt(source, qta=-X, bil=1) per ogni source;
+                INSERT dt(target, qta=+ΣX, bil=1) sul target;
+                scarica_fittizio() per tutti.
+
+    B. CAMBIA TENDONE (fallback, solo se A non disponibile)
+       - Candidati: tendoni la cui dose risultante con la qta_attuale del
+         trattamento target rientra in [min, max] etichetta.
+       - L'utente sceglie un tendone.
+       - Salva: UPDATE dettaglio_trattamenti SET tendone_id=:nuovo WHERE
+                trattamento_id=:tid AND tendone_id=:vecchio;
+                scarica_fittizio(tid).
+
+    Il magazzino REALE non viene MAI toccato (i bilanciamenti agiscono solo
+    su trattamenti is_autorizzato=1, e scarica_fittizio aggiorna solo il
+    registro fittizio).
+    """
+
+    def __init__(self, engine, prodotto_id, nome_prodotto, tendone_id, ettari,
+                 qta_tot_target, botti_tot_target, sottodose, min_s, max_s, um,
+                 parent=None):
+        super().__init__(parent)
+        self.engine = engine
+        self.prodotto_id = prodotto_id
+        self.nome_prodotto = nome_prodotto
+        self.tendone_id = tendone_id
+        self.ettari = float(ettari)
+        self.qta_tot_target = float(qta_tot_target)
+        self.botti_tot_target = float(botti_tot_target)
+        self.sottodose = float(sottodose)  # quantità mancante per il min
+        self.min_s = float(min_s)
+        self.max_s = float(max_s)
+        self.um = str(um or "").lower()
+        self.is_hl = "/hl" in self.um
+
+        self.setWindowTitle(f"Bilancia Sottodosaggio — {nome_prodotto}")
+        self.setMinimumWidth(750)
+        self.setMinimumHeight(420)
+        layout = QVBoxLayout(self)
+
+        # Header informativo: tendone, qta, deficit
+        if self.is_hl:
+            bc = self.botti_tot_target if self.botti_tot_target > 0 else _botti_stimate(self.ettari)
+            dose_attuale = self.qta_tot_target / (bc * 10.0) if bc > 0 else 0
+        else:
+            dose_attuale = self.qta_tot_target / self.ettari if self.ettari > 0 else 0
+        info_lbl = QLabel(
+            f"Tendone in <b>sottodose</b> per il prodotto <b>{nome_prodotto}</b>.<br>"
+            f"Quantità attuale: <b>{self.qta_tot_target:.4f} {self.um.split('/')[0]}</b>, "
+            f"dose attuale: <b>{dose_attuale:.2f} {self.um}</b> "
+            f"(min etichetta: {self.min_s:.2f} {self.um}).<br>"
+            f"Deficit da colmare: <b>{self.sottodose:.4f} {self.um.split('/')[0]}</b>."
+        )
+        info_lbl.setWordWrap(True)
+        layout.addWidget(info_lbl)
+
+        # Carico candidati STRATEGIA A (prelievo)
+        self._candidati_source = self._carica_candidati_source()
+
+        if self._candidati_source:
+            self._build_ui_strategia_a(layout)
+        else:
+            # Fallback: carico candidati STRATEGIA B (cambia tendone)
+            self._candidati_tendone = self._carica_candidati_tendone()
+            self._build_ui_strategia_b(layout)
+
+    # ────────────────────────────────────────────────────────────────
+    # Caricamento candidati
+    # ────────────────────────────────────────────────────────────────
+
+    def _carica_candidati_source(self) -> list[dict]:
+        """Trattamenti revisionati dello stesso prodotto con margine prelevabile.
+
+        Margine = qta_attuale_su_tendone - min × volume_acqua_source. Solo
+        margini > 0 sono candidati. Cross-azienda permesso. Esclude il
+        tendone target (non si preleva da se stessi).
+        """
+        with self.engine.connect() as conn:
+            rows = conn.execute(text("""
+                SELECT
+                    tr.id AS tratt_id,
+                    dt.tendone_id,
+                    ten.codice AS ten_codice,
+                    ten.ettari AS ten_ettari,
+                    az.nome AS az_nome,
+                    SUM(dt.quantita_sostanza) AS qta,
+                    SUM(CASE WHEN dt.botti > 0 THEN dt.botti ELSE 0 END) AS botti
+                FROM dettaglio_trattamenti dt
+                JOIN trattamenti tr ON tr.id = dt.trattamento_id
+                JOIN tendoni ten ON ten.id = dt.tendone_id
+                JOIN contrade c ON c.id = ten.contrada_id
+                JOIN agri ag ON ag.id = c.agro_id
+                JOIN aziende az ON az.id = ag.azienda_id
+                WHERE tr.prodotto_id = :pid
+                  AND tr.is_autorizzato = 1
+                  AND dt.tendone_id != :tid_target
+                GROUP BY tr.id, dt.tendone_id
+                HAVING qta > 0
+            """), {"pid": self.prodotto_id, "tid_target": self.tendone_id}).fetchall()
+
+        candidati = []
+        for r in rows:
+            t_id, te_id, codice, ha, az, qta, botti = r
+            qta = float(qta or 0)
+            botti = float(botti or 0)
+            ha = float(ha)
+            if self.is_hl:
+                vol = (botti if botti > 0 else _botti_stimate(ha)) * 10.0
+                qta_min_richiesta = self.min_s * vol
+            else:
+                qta_min_richiesta = self.min_s * ha
+            margine = round(qta - qta_min_richiesta, 4)
+            if margine <= 0.0001:
+                continue
+            candidati.append({
+                "tratt_id": t_id, "tendone_id": te_id, "codice": codice,
+                "ettari": ha, "azienda": az, "qta": qta, "botti": botti,
+                "margine": margine,
+            })
+        return candidati
+
+    def _carica_candidati_tendone(self) -> list[dict]:
+        """Tendoni per cui spostare il trattamento farebbe rientrare la dose
+        nel range etichetta. Considera l'eventuale prodotto pre-esistente su
+        ciascun tendone candidato (la qta del target verrebbe sommata).
+
+        Esclude il tendone corrente (non ha senso "rimanere"). Cross-azienda
+        permesso. Mostra anche i tendoni con altri trattamenti dello stesso
+        prodotto: la qta si somma, la dose risultante potrebbe rientrare.
+        """
+        with self.engine.connect() as conn:
+            rows = conn.execute(text("""
+                SELECT
+                    t.id, t.codice, t.ettari, az.nome AS az_nome,
+                    COALESCE((
+                        SELECT SUM(dt2.quantita_sostanza)
+                        FROM dettaglio_trattamenti dt2
+                        JOIN trattamenti tr2 ON tr2.id = dt2.trattamento_id
+                        WHERE dt2.tendone_id = t.id AND tr2.prodotto_id = :pid
+                    ), 0) AS qta_esistente,
+                    COALESCE((
+                        SELECT SUM(CASE WHEN dt3.botti > 0 THEN dt3.botti ELSE 0 END)
+                        FROM dettaglio_trattamenti dt3
+                        JOIN trattamenti tr3 ON tr3.id = dt3.trattamento_id
+                        WHERE dt3.tendone_id = t.id AND tr3.prodotto_id = :pid
+                    ), 0) AS botti_esistente
+                FROM tendoni t
+                JOIN contrade c ON c.id = t.contrada_id
+                JOIN agri ag ON ag.id = c.agro_id
+                JOIN aziende az ON az.id = ag.azienda_id
+                WHERE t.id != :tid_target
+            """), {"pid": self.prodotto_id, "tid_target": self.tendone_id}).fetchall()
+
+        candidati = []
+        for r in rows:
+            t_id, codice, ha, az, qta_esistente, botti_esistente = r
+            ha = float(ha)
+            qta_esistente = float(qta_esistente or 0)
+            botti_esistente = float(botti_esistente or 0)
+            # qta che andrebbe sul nuovo tendone se si sposta il target:
+            # tutta la qta_tot del target (su quel tendone) + quanto già esiste.
+            qta_finale = qta_esistente + self.qta_tot_target
+            if self.is_hl:
+                botti_finale = (botti_esistente if botti_esistente > 0
+                                else _botti_stimate(ha))
+                volume_finale = botti_finale * 10.0
+            else:
+                volume_finale = ha
+            dose_finale = qta_finale / volume_finale if volume_finale > 0 else 0
+            if self.min_s <= dose_finale <= self.max_s:
+                candidati.append({
+                    "tendone_id": t_id, "codice": codice, "ettari": ha,
+                    "azienda": az, "qta_esistente": qta_esistente,
+                    "qta_finale": qta_finale, "dose_finale": dose_finale,
+                })
+        # Ordina per "centratura" rispetto alla media min-max (la dose più
+        # centrata appare in cima — è la scelta "più sicura").
+        media = (self.min_s + self.max_s) / 2
+        candidati.sort(key=lambda c: abs(c["dose_finale"] - media))
+        return candidati
+
+    # ────────────────────────────────────────────────────────────────
+    # UI Strategia A: prelievo
+    # ────────────────────────────────────────────────────────────────
+
+    def _build_ui_strategia_a(self, layout):
+        layout.addWidget(QLabel(
+            "<b>Strategia: preleva prodotto da altri trattamenti</b>"
+        ))
+        layout.addWidget(QLabel(
+            "Specifica la quantità da prelevare da ciascun trattamento. "
+            "I source non scenderanno sotto il min etichetta."
+        ))
+
+        # Tabella manuale: usiamo un QTableView con modello custom + delegate
+        # per il QDoubleSpinBox della qta. Più semplice: un widget composto
+        # riga per riga.
+        self.tabella_source = QTableView()
+        self.modello_source = QStandardItemModel(
+            len(self._candidati_source), 6
+        )
+        self.modello_source.setHorizontalHeaderLabels([
+            "T#", "Tendone", "Azienda", "Qta attuale", "Margine", "Da prelevare",
+        ])
+        for i, c in enumerate(self._candidati_source):
+            um_simple = self.um.split('/')[0]
+            cells = [
+                str(c["tratt_id"]), c["codice"], c["azienda"],
+                f"{c['qta']:.4f} {um_simple}",
+                f"{c['margine']:.4f} {um_simple}",
+                "0.0000",  # editabile
+            ]
+            for j, val in enumerate(cells):
+                item = QStandardItem(val)
+                item.setEditable(j == 5)  # solo la colonna "Da prelevare"
+                self.modello_source.setItem(i, j, item)
+        self.tabella_source.setModel(self.modello_source)
+        self.tabella_source.resizeColumnsToContents()
+        self.modello_source.itemChanged.connect(self._on_prelievo_changed)
+        layout.addWidget(self.tabella_source)
+
+        self.lbl_totale = QLabel()
+        layout.addWidget(self.lbl_totale)
+        self._aggiorna_totale_prelievo()
+
+        btns = QHBoxLayout()
+        btn_proporci = QPushButton("📐 Proponi distribuzione automatica")
+        btn_proporci.clicked.connect(self._proponi_distribuzione)
+        btns.addWidget(btn_proporci)
+        btns.addStretch()
+        btn_annulla = QPushButton("Annulla")
+        btn_annulla.clicked.connect(self.reject)
+        btn_esegui = QPushButton("⚖️ Esegui Prelievo")
+        btn_esegui.setProperty("class", "success")
+        btn_esegui.clicked.connect(self._salva_strategia_a)
+        btns.addWidget(btn_annulla)
+        btns.addWidget(btn_esegui)
+        layout.addLayout(btns)
+
+    def _proponi_distribuzione(self):
+        """Distribuzione proporzionale ai margini disponibili, finché si copre
+        il deficit (o si esauriscono i margini)."""
+        margini_totali = sum(c["margine"] for c in self._candidati_source)
+        if margini_totali <= 0:
+            return
+        residuo = self.sottodose
+        for i, c in enumerate(self._candidati_source):
+            # Proporzionale al margine, ma cappato al margine stesso.
+            quota_propor = self.sottodose * (c["margine"] / margini_totali)
+            quota = min(quota_propor, c["margine"], residuo)
+            quota = round(max(0.0, quota), 4)
+            self.modello_source.blockSignals(True)
+            self.modello_source.item(i, 5).setText(f"{quota:.4f}")
+            self.modello_source.blockSignals(False)
+            residuo -= quota
+        self._aggiorna_totale_prelievo()
+
+    def _on_prelievo_changed(self, item):
+        if item.column() != 5:
+            return
+        # Validazione: il prelievo non può superare il margine.
+        r = item.row()
+        try:
+            valore = float(item.text().replace(",", "."))
+        except ValueError:
+            valore = 0.0
+        margine = self._candidati_source[r]["margine"]
+        if valore < 0:
+            valore = 0.0
+        elif valore > margine:
+            valore = margine
+        # Aggiorna cella senza ri-emettere il signal
+        self.modello_source.blockSignals(True)
+        item.setText(f"{valore:.4f}")
+        self.modello_source.blockSignals(False)
+        self._aggiorna_totale_prelievo()
+
+    def _aggiorna_totale_prelievo(self):
+        totale = 0.0
+        for r in range(self.modello_source.rowCount()):
+            try:
+                totale += float(self.modello_source.item(r, 5).text().replace(",", "."))
+            except (ValueError, AttributeError):
+                pass
+        residuo = round(self.sottodose - totale, 4)
+        um_simple = self.um.split('/')[0]
+        if residuo > 0.0001:
+            stato = (f"<span style='color:#c00'>Residuo: {residuo:.4f} "
+                     f"{um_simple} (target resterà sottodose)</span>")
+        elif residuo < -0.0001:
+            stato = (f"<span style='color:#c00'>Prelievo eccede il deficit "
+                     f"di {-residuo:.4f} {um_simple}</span>")
+        else:
+            stato = "<span style='color:#080'>Deficit completamente coperto</span>"
+        self.lbl_totale.setText(
+            f"Totale prelevato: <b>{totale:.4f} {um_simple}</b> / "
+            f"Deficit: {self.sottodose:.4f} {um_simple}<br>{stato}"
+        )
+
+    def _salva_strategia_a(self):
+        """Applica i prelievi: dt negativi sui source, dt positivo sul target.
+        scarica_fittizio per ogni trattamento toccato."""
+        prelievi = []
+        for r in range(self.modello_source.rowCount()):
+            try:
+                qta = float(self.modello_source.item(r, 5).text().replace(",", "."))
+            except (ValueError, AttributeError):
+                qta = 0.0
+            if qta > 0.0001:
+                prelievi.append((self._candidati_source[r], round(qta, 4)))
+
+        if not prelievi:
+            QMessageBox.warning(self, "Nessun prelievo", "Inserisci almeno una quantità da prelevare.")
+            return
+
+        totale = sum(p[1] for p in prelievi)
+        if totale > self.sottodose + 0.0001:
+            QMessageBox.warning(self, "Prelievo eccessivo",
+                                f"Il totale prelevato ({totale:.4f}) eccede il deficit "
+                                f"({self.sottodose:.4f}). Riduci uno o più prelievi.")
+            return
+
+        residuo = round(self.sottodose - totale, 4)
+        if residuo > 0.0001:
+            risposta = QMessageBox.question(
+                self, "Copertura parziale",
+                f"Il prelievo totale ({totale:.4f}) NON copre il deficit "
+                f"({self.sottodose:.4f}). Il target resterà sottodose di "
+                f"{residuo:.4f}.\n\nProcedere comunque?",
+                QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+                QMessageBox.StandardButton.No,
+            )
+            if risposta != QMessageBox.StandardButton.Yes:
+                return
+
+        # Per il target serve l'id del trattamento (UN trattamento revisionato
+        # su questo tendone con questo prodotto). Se ne esistesse più di uno,
+        # prendiamo il più recente: il nuovo dt è aggregato in SUM.
+        try:
+            with self.engine.begin() as conn:
+                target_tratt_id = conn.execute(text("""
+                    SELECT tr.id FROM trattamenti tr
+                    JOIN dettaglio_trattamenti dt ON dt.trattamento_id = tr.id
+                    WHERE tr.prodotto_id = :pid AND dt.tendone_id = :tid
+                      AND tr.is_autorizzato = 1
+                    ORDER BY tr.data_trattamento DESC, tr.id DESC
+                    LIMIT 1
+                """), {"pid": self.prodotto_id, "tid": self.tendone_id}).scalar()
+                if target_tratt_id is None:
+                    QMessageBox.critical(self, "Errore",
+                                         "Impossibile trovare un trattamento revisionato target.")
+                    return
+
+                src_tratt_ids = set()
+                for cand, qta in prelievi:
+                    # dt negativo sul source
+                    conn.execute(text("""
+                        INSERT INTO dettaglio_trattamenti
+                            (trattamento_id, tendone_id, quantita_sostanza, botti, is_bilanciamento)
+                        VALUES (:tr, :te, :q, 0, 1)
+                    """), {"tr": cand["tratt_id"], "te": cand["tendone_id"], "q": -qta})
+                    src_tratt_ids.add(cand["tratt_id"])
+
+                # dt positivo aggregato sul target
+                conn.execute(text("""
+                    INSERT INTO dettaglio_trattamenti
+                        (trattamento_id, tendone_id, quantita_sostanza, botti, is_bilanciamento)
+                    VALUES (:tr, :te, :q, 0, 1)
+                """), {"tr": target_tratt_id, "te": self.tendone_id, "q": totale})
+
+                # Ricalcola scarichi fittizi per tutti i trattamenti toccati.
+                # Il reale NON viene toccato (nessuna chiamata a scarica_reale).
+                for src_id in src_tratt_ids:
+                    scarica_fittizio(conn, src_id)
+                scarica_fittizio(conn, target_tratt_id)
+
+            # Backend ops + avvisi (fuori transazione locale)
+            for src_id in src_tratt_ids:
+                payload = _build_trattamento_payload(self.engine, src_id)
+                if payload:
+                    enqueue_operation(self.engine, "TRATTAMENTO", "UPDATE",
+                                      entity_id=src_id, payload=payload)
+            payload_t = _build_trattamento_payload(self.engine, target_tratt_id)
+            if payload_t:
+                enqueue_operation(self.engine, "TRATTAMENTO", "UPDATE",
+                                  entity_id=target_tratt_id, payload=payload_t)
+
+            ricalcola_avvisi_globali(self.engine)
+            self.accept()
+            QMessageBox.information(self, "Operazione completata",
+                                    f"Prelevati {totale:.4f} da {len(prelievi)} trattament"
+                                    f"{'o' if len(prelievi)==1 else 'i'} source.")
+        except Exception as e:
+            QMessageBox.critical(self, "Errore", f"Operazione fallita:\n{str(e)}")
+
+    # ────────────────────────────────────────────────────────────────
+    # UI Strategia B: cambia tendone
+    # ────────────────────────────────────────────────────────────────
+
+    def _build_ui_strategia_b(self, layout):
+        layout.addWidget(QLabel(
+            "<b>Nessun trattamento source disponibile con eccedenza.</b>"
+        ))
+
+        if not self._candidati_tendone:
+            # STRATEGIA C — fallback finale: cancella il trattamento.
+            # Quando né la A (preleva) né la B (cambia tendone) hanno
+            # candidati, l'unica strada per uscire dalla sottodose è
+            # cancellare il trattamento. La qta torna disponibile nel
+            # magazzino fittizio. Se il trattamento è un sub-bilanciamento,
+            # cancelliamo anche i dt negativi corrispondenti nei source.
+            layout.addWidget(QLabel(
+                "<b>Nessun tendone candidato per uno spostamento.</b>"
+            ))
+            layout.addWidget(QLabel(
+                "Strategia di ultima istanza: <b>cancella il trattamento</b>. "
+                f"La quantità di <b>{self.qta_tot_target:.4f} "
+                f"{self.um.split('/')[0]}</b> torna disponibile nel magazzino "
+                "fittizio."
+            ))
+            btns = QHBoxLayout()
+            btns.addStretch()
+            btn_annulla = QPushButton("Annulla")
+            btn_annulla.clicked.connect(self.reject)
+            btn_cancella = QPushButton("🗑️ Cancella Trattamento")
+            btn_cancella.setProperty("class", "danger")
+            btn_cancella.clicked.connect(self._cancella_trattamento_target)
+            btns.addWidget(btn_annulla)
+            btns.addWidget(btn_cancella)
+            layout.addLayout(btns)
+            return
+
+        layout.addWidget(QLabel(
+            "Strategia alternativa: <b>cambia tendone</b>. Mantenendo la qta "
+            "attuale, scegli un tendone con un volume di acqua tale da far "
+            "rientrare la dose nel range etichetta."
+        ))
+
+        self.tabella_tendoni = QTableView()
+        self.tabella_tendoni.setSelectionBehavior(
+            QTableView.SelectionBehavior.SelectRows
+        )
+        self.tabella_tendoni.setSelectionMode(
+            QTableView.SelectionMode.SingleSelection
+        )
+        self.modello_tendoni = QStandardItemModel(
+            len(self._candidati_tendone), 5
+        )
+        self.modello_tendoni.setHorizontalHeaderLabels([
+            "Tendone", "Azienda", "Ettari", "Qta esistente",
+            f"Dose risultante ({self.um})",
+        ])
+        for i, c in enumerate(self._candidati_tendone):
+            um_simple = self.um.split('/')[0]
+            cells = [
+                c["codice"], c["azienda"], f"{c['ettari']:.4f}",
+                f"{c['qta_esistente']:.4f} {um_simple}",
+                f"{c['dose_finale']:.2f}",
+            ]
+            for j, val in enumerate(cells):
+                item = QStandardItem(val)
+                item.setEditable(False)
+                self.modello_tendoni.setItem(i, j, item)
+        self.tabella_tendoni.setModel(self.modello_tendoni)
+        self.tabella_tendoni.resizeColumnsToContents()
+        layout.addWidget(self.tabella_tendoni)
+
+        btns = QHBoxLayout()
+        btns.addStretch()
+        btn_annulla = QPushButton("Annulla")
+        btn_annulla.clicked.connect(self.reject)
+        btn_esegui = QPushButton("🔀 Esegui Spostamento")
+        btn_esegui.setProperty("class", "warning")
+        btn_esegui.clicked.connect(self._salva_strategia_b)
+        btns.addWidget(btn_annulla)
+        btns.addWidget(btn_esegui)
+        layout.addLayout(btns)
+
+    def _salva_strategia_b(self):
+        """Sposta tutti i dt del trattamento target dal tendone corrente al
+        tendone selezionato. scarica_fittizio per il trattamento toccato.
+        Il reale NON viene mai toccato."""
+        idx = self.tabella_tendoni.currentIndex()
+        if not idx.isValid():
+            QMessageBox.warning(self, "Seleziona", "Seleziona un tendone dalla lista.")
+            return
+        nuovo = self._candidati_tendone[idx.row()]
+        nuovo_tendone_id = nuovo["tendone_id"]
+        nuovo_codice = nuovo["codice"]
+
+        risposta = QMessageBox.question(
+            self, "Conferma spostamento",
+            f"Confermi di spostare la qta del trattamento sul tendone "
+            f"<b>{nuovo_codice}</b>?<br><br>"
+            f"Dose risultante: <b>{nuovo['dose_finale']:.2f} {self.um}</b> "
+            f"(min: {self.min_s:.2f}, max: {self.max_s:.2f}).<br>"
+            f"Il dato sul vecchio tendone verrà rimosso.",
+            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+            QMessageBox.StandardButton.No,
+        )
+        if risposta != QMessageBox.StandardButton.Yes:
+            return
+
+        try:
+            with self.engine.begin() as conn:
+                # Trova trattamenti revisionati con dt sul tendone corrente
+                # per questo prodotto. Possono essercene più di uno: spostiamo
+                # tutti i loro dt sul nuovo tendone.
+                tratt_ids = [r[0] for r in conn.execute(text("""
+                    SELECT DISTINCT tr.id
+                    FROM trattamenti tr
+                    JOIN dettaglio_trattamenti dt ON dt.trattamento_id = tr.id
+                    WHERE tr.prodotto_id = :pid AND dt.tendone_id = :tid
+                      AND tr.is_autorizzato = 1
+                """), {"pid": self.prodotto_id, "tid": self.tendone_id}).fetchall()]
+
+                if not tratt_ids:
+                    QMessageBox.critical(self, "Errore",
+                                         "Nessun trattamento revisionato trovato.")
+                    return
+
+                # Spostamento via dt di bilanciamento, NON modificando i dt
+                # originali. Per ogni trattamento revisionato sul tendone
+                # vecchio:
+                #   - calcola la SUM di tutti i dt sul tendone vecchio
+                #     (originale + eventuali bilanciamenti pregressi)
+                #   - INSERT dt bil=1 col tendone VECCHIO e qta=-totale
+                #     (annulla nel fittizio la presenza sul vecchio)
+                #   - INSERT dt bil=1 col tendone NUOVO e qta=+totale
+                #     (posiziona nel fittizio sul nuovo)
+                # Risultato:
+                #   - dt is_bilanciamento=0 (originale): INVARIATO → la
+                #     storia del trattamento resta com'era, il reale
+                #     (filtra solo bil=0) NON cambia.
+                #   - fittizio (somma tutto): vecchio +0, nuovo +totale →
+                #     il magazzino fittizio si aggiorna allo spostamento.
+                for tid in tratt_ids:
+                    qta_da_spostare = conn.execute(text("""
+                        SELECT COALESCE(SUM(quantita_sostanza), 0)
+                        FROM dettaglio_trattamenti
+                        WHERE trattamento_id = :tid AND tendone_id = :tvecchio
+                    """), {"tid": tid, "tvecchio": self.tendone_id}).scalar() or 0
+                    qta_da_spostare = float(qta_da_spostare)
+                    if abs(qta_da_spostare) < 1e-6:
+                        continue
+                    # Annulla nel fittizio l'effetto sul vecchio tendone
+                    conn.execute(text("""
+                        INSERT INTO dettaglio_trattamenti
+                            (trattamento_id, tendone_id, quantita_sostanza, botti, is_bilanciamento)
+                        VALUES (:tid, :te, :q, 0, 1)
+                    """), {"tid": tid, "te": self.tendone_id, "q": -qta_da_spostare})
+                    # Posiziona nel fittizio sul nuovo tendone
+                    conn.execute(text("""
+                        INSERT INTO dettaglio_trattamenti
+                            (trattamento_id, tendone_id, quantita_sostanza, botti, is_bilanciamento)
+                        VALUES (:tid, :te, :q, 0, 1)
+                    """), {"tid": tid, "te": nuovo_tendone_id, "q": qta_da_spostare})
+
+                # Ricalcola scarichi fittizi per ogni trattamento toccato.
+                # Il reale NON viene chiamato (congelato + i dt bil=0
+                # non sono stati modificati).
+                for tid in tratt_ids:
+                    scarica_fittizio(conn, tid)
+
+            # Backend ops
+            for tid in tratt_ids:
+                payload = _build_trattamento_payload(self.engine, tid)
+                if payload:
+                    enqueue_operation(self.engine, "TRATTAMENTO", "UPDATE",
+                                      entity_id=tid, payload=payload)
+
+            ricalcola_avvisi_globali(self.engine)
+            self.accept()
+            QMessageBox.information(
+                self, "Spostamento completato",
+                f"Trattamento spostato sul tendone <b>{nuovo_codice}</b>. "
+                f"Dose risultante: {nuovo['dose_finale']:.2f} {self.um}.",
+            )
+        except Exception as e:
+            QMessageBox.critical(self, "Errore", f"Operazione fallita:\n{str(e)}")
+
+    # ────────────────────────────────────────────────────────────────
+    # Strategia C: cancella trattamento (fallback finale)
+    # ────────────────────────────────────────────────────────────────
+
+    def _cancella_trattamento_target(self):
+        """Strategia C: cancella il trattamento revisionato target.
+
+        SOLO il trattamento target viene cancellato. La sua qta torna nel
+        magazzino fittizio (via cancellazione del suo scarico).
+
+        Gli altri trattamenti collegati (source originali o altri sub) NON
+        vengono toccati in alcun modo: i loro dt restano invariati e il
+        loro magazzino fittizio NON viene ricalcolato. È una scelta
+        consapevole: il bilanciamento è "annullato" lato target, ma le
+        contropartite contabili sui source restano come traccia.
+
+        Reale: non toccato in nessun caso (snapshot congelato)."""
+        risposta = QMessageBox.question(
+            self, "Cancella Trattamento",
+            f"Confermi la cancellazione del trattamento revisionato di "
+            f"<b>{self.nome_prodotto}</b> su questo tendone?<br><br>"
+            f"La quantità di <b>{self.qta_tot_target:.4f} "
+            f"{self.um.split('/')[0]}</b> tornerà disponibile nel magazzino "
+            f"fittizio. Il magazzino reale e gli altri trattamenti collegati "
+            f"non vengono toccati.",
+            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+            QMessageBox.StandardButton.No,
+        )
+        if risposta != QMessageBox.StandardButton.Yes:
+            return
+
+        try:
+            with self.engine.begin() as conn:
+                target_tratt_id = conn.execute(text("""
+                    SELECT tr.id FROM trattamenti tr
+                    JOIN dettaglio_trattamenti dt ON dt.trattamento_id = tr.id
+                    WHERE tr.prodotto_id = :pid AND dt.tendone_id = :tid
+                      AND tr.is_autorizzato = 1
+                    ORDER BY tr.data_trattamento DESC, tr.id DESC
+                    LIMIT 1
+                """), {"pid": self.prodotto_id, "tid": self.tendone_id}).scalar()
+
+                if not target_tratt_id:
+                    QMessageBox.critical(self, "Errore",
+                                         "Trattamento revisionato non trovato.")
+                    return
+
+                # Cancella scarico fittizio del SOLO target (reale: congelato).
+                cancella_scarico_fittizio(conn, target_tratt_id)
+
+                # DELETE solo della testata target + sue righe figlie.
+                # Nessuna pulizia su altri trattamenti collegati: la qta
+                # negativa eventuale nei source resta come traccia.
+                conn.execute(text(
+                    "DELETE FROM avvisi_trattamenti WHERE trattamento_id = :id"
+                ), {"id": target_tratt_id})
+                conn.execute(text(
+                    "DELETE FROM dettaglio_trattamenti WHERE trattamento_id = :id"
+                ), {"id": target_tratt_id})
+                conn.execute(text(
+                    "DELETE FROM trattamenti WHERE id = :id"
+                ), {"id": target_tratt_id})
+
+            # Backend: notifica delete del solo target.
+            enqueue_operation(self.engine, "TRATTAMENTO", "DELETE",
+                              entity_id=target_tratt_id)
+            ricalcola_avvisi_globali(self.engine)
+
+            self.accept()
+            QMessageBox.information(
+                self, "Trattamento cancellato",
+                "Il trattamento è stato cancellato. Il prodotto è disponibile "
+                "nel magazzino fittizio. Gli altri trattamenti collegati "
+                "non sono stati modificati.",
+            )
+        except Exception as e:
             QMessageBox.critical(self, "Errore", f"Operazione fallita:\n{str(e)}")
 
 
@@ -780,7 +1493,7 @@ class DialogStoricoProdottiTendone(QDialog):
         layout.addWidget(self.tabella)
 
         btns = QHBoxLayout()
-        btn_compensa = QPushButton("⚖️ Bilancia Disavanzo")
+        btn_compensa = QPushButton("⚖️ Bilancia")
         btn_undo = QPushButton("↩️ Annulla Ultimo")
         btn_compensa.setProperty('class', 'warning')
         btn_undo.setProperty('class', 'danger')
@@ -794,19 +1507,28 @@ class DialogStoricoProdottiTendone(QDialog):
     def _carica(self):
         with self.engine.connect() as conn:
             filtro_sql = f"AND p.id = {self.prodotto_filtrato_id}" if self.prodotto_filtrato_id else ""
+            # Per /hl il volume d'acqua è SOMMA(botti) × 10 hl (botti reali),
+            # con fallback a ettari × 10 quando non risultano botti (record
+            # storici incompleti). Usare gli ettari come stima quando esistono
+            # botti reali falsa sia la dose cumulativa che la rimanenza.
             righe = conn.execute(text(f"""
                 SELECT
                     p.nome_prodotto, p.unita_misura, COUNT(DISTINCT t.id),
                     ROUND(SUM(dt.quantita_sostanza), 4),
 
-                    -- (Somma Totale Quantità) / (Somma Totale Volumi)
+                    -- Dose cumulativa = qta_totale / volume_acqua effettivo
                     ROUND(CASE
-                        WHEN LOWER(p.unita_misura) LIKE '%/hl'
-                        THEN SUM(dt.quantita_sostanza) / (:ettari * 10.0)
+                        WHEN LOWER(p.unita_misura) LIKE '%/hl' THEN
+                            SUM(dt.quantita_sostanza) /
+                            (CASE WHEN COALESCE(SUM(dt.botti), 0) > 0
+                                  THEN SUM(dt.botti) * 10.0
+                                  ELSE :ettari * 10.0
+                             END)
                         ELSE SUM(dt.quantita_sostanza) / :ettari
                     END, 1) as d_cum,
 
-                    0, MAX(t.data_trattamento), p.min_sostanza, p.max_sostanza
+                    0, MAX(t.data_trattamento), p.min_sostanza, p.max_sostanza,
+                    COALESCE(SUM(dt.botti), 0) AS botti_tot
                 FROM dettaglio_trattamenti dt
                 JOIN trattamenti t ON t.id = dt.trattamento_id
                 JOIN prodotti p ON p.id = t.prodotto_id
@@ -826,7 +1548,17 @@ class DialogStoricoProdottiTendone(QDialog):
         for r, riga in enumerate(righe):
             d_cum, max_s = float(riga[4] or 0), float(riga[8] or 0)
             um = str(riga[1] or "").lower()
-            rimanenza = round((max_s - d_cum) * self.ettari * (10.0 if '/hl' in um else 1.0), 4)
+            botti_tot = float(riga[9] or 0)
+            # Rimanenza = qta_max_consentita - qta_usata. Per /hl il volume è
+            # botti×10 (botti reali); fallback agli ettari quando il record
+            # storico non ha botti registrate.
+            if '/hl' in um:
+                volume_hl = botti_tot * 10.0 if botti_tot > 0 else self.ettari * 10.0
+                qta_max = max_s * volume_hl
+            else:
+                qta_max = max_s * self.ettari
+            qta_usata = float(riga[3] or 0)
+            rimanenza = round(qta_max - qta_usata, 4)
 
             if max_s > 0 and d_cum > max_s:
                 bg = QColor(255, 210, 210)
@@ -852,7 +1584,7 @@ class DialogStoricoProdottiTendone(QDialog):
             QMessageBox.information(
                 self, "Seleziona un prodotto",
                 "Clicca prima su una riga della tabella per scegliere il prodotto "
-                "da bilanciare, poi premi 'Bilancia Disavanzo'.",
+                "da bilanciare, poi premi 'Bilancia'.",
             )
             return
         nome_prodotto = self.tabella.model().item(idx.row(), 0).text()
@@ -860,29 +1592,81 @@ class DialogStoricoProdottiTendone(QDialog):
         with self.engine.connect() as conn:
             limiti = conn.execute(text("SELECT id, max_sostanza, unita_misura FROM prodotti WHERE nome_prodotto=:n"), {"n": nome_prodotto}).fetchone()
 
-            # Blocco se manca la dose massima: senza limiti d'etichetta non si bilancia
+            # Blocco se mancano i limiti d'etichetta: serve sia max che min.
             if not limiti[1] or float(limiti[1]) <= 0:
                 QMessageBox.warning(self, "Operazione non consentita",
                                     f"Il prodotto '{nome_prodotto}' non ha una dose massima definita in anagrafica.\n"
                                     "Il bilanciamento è possibile solo per prodotti con limiti di etichetta.")
                 return
 
+            min_s_row = conn.execute(text(
+                "SELECT min_sostanza FROM prodotti WHERE id = :pid"
+            ), {"pid": limiti[0]}).scalar()
+
             stats = conn.execute(text("SELECT SUM(quantita_sostanza), SUM(botti) FROM dettaglio_trattamenti dt JOIN trattamenti tr ON tr.id = dt.trattamento_id WHERE tr.prodotto_id = :pid AND dt.tendone_id = :tid"), {"pid": limiti[0], "tid": self.tendone_id}).fetchone()
 
-        qta_tot, botti_tot, max_s, um = float(stats[0] or 0), float(stats[1] or 0), float(limiti[1] or 0), str(limiti[2]).lower()
-        if '/hl' in um:
-            deficit = round(qta_tot - (max_s * (botti_tot if botti_tot > 0 else self.ettari) * 10.0), 4)
-        else:
-            deficit = round(qta_tot - (max_s * self.ettari), 4)
+            # Blocco: i bilanciamenti modificano solo il magazzino fittizio,
+            # che è alimentato dai trattamenti Revisionati. Se per questo
+            # prodotto su questo tendone non c'è alcun trattamento autorizzato,
+            # bilanciare non avrebbe effetto sul magazzino. Vietiamo a monte.
+            n_revisionati = conn.execute(text("""
+                SELECT COUNT(DISTINCT tr.id)
+                FROM dettaglio_trattamenti dt
+                JOIN trattamenti tr ON tr.id = dt.trattamento_id
+                WHERE tr.prodotto_id = :pid AND dt.tendone_id = :tid
+                  AND tr.is_autorizzato = 1
+            """), {"pid": limiti[0], "tid": self.tendone_id}).scalar() or 0
+            if n_revisionati == 0:
+                QMessageBox.warning(
+                    self, "Bilanciamento non disponibile",
+                    f"Il prodotto '{nome_prodotto}' su questo tendone risulta solo "
+                    "in Storico (nessun trattamento Revisionato).\n\n"
+                    "Il bilanciamento è permesso solo sui trattamenti Revisionati: "
+                    "revisiona prima il trattamento, poi torna qui.",
+                )
+                return
 
-        if deficit > 0:
-            if DialogCompensaDisavanzo(self.engine, limiti[0], nome_prodotto, self.tendone_id, "T", deficit, self).exec():
+        qta_tot, botti_tot = float(stats[0] or 0), float(stats[1] or 0)
+        max_s = float(limiti[1] or 0)
+        min_s = float(min_s_row or 0)
+        um = str(limiti[2]).lower()
+
+        # Volume effettivo per il calcolo della dose: per /hl usa botti reali
+        # con fallback alla stima _botti_stimate (vedi nota sulla coerenza).
+        if '/hl' in um:
+            botti_calc = botti_tot if botti_tot > 0 else _botti_stimate(self.ettari)
+            volume_hl = botti_calc * 10.0
+            qta_max_consentita = max_s * volume_hl
+            qta_min_consentita = min_s * volume_hl
+        else:
+            qta_max_consentita = max_s * self.ettari
+            qta_min_consentita = min_s * self.ettari
+
+        sovradose = round(qta_tot - qta_max_consentita, 4)
+        sottodose = round(qta_min_consentita - qta_tot, 4)
+
+        if sovradose > 0:
+            # Caso 1: il trattamento eccede il max etichetta → spalma altrove.
+            if DialogCompensaDisavanzo(
+                self.engine, limiti[0], nome_prodotto,
+                self.tendone_id, "T", sovradose, self,
+            ).exec():
+                self._carica()
+        elif sottodose > 0 and min_s > 0:
+            # Caso 2: il trattamento è sotto al min etichetta → preleva da
+            # altri trattamenti, oppure (fallback) sposta su un tendone con
+            # volume diverso che fa rientrare la dose nel range.
+            if DialogCompensaSottodose(
+                self.engine, limiti[0], nome_prodotto,
+                self.tendone_id, self.ettari, qta_tot, botti_tot,
+                sottodose, min_s, max_s, um, self,
+            ).exec():
                 self._carica()
         else:
             QMessageBox.information(
-                self, "Nessun disavanzo",
-                f"Il prodotto '{nome_prodotto}' è già entro la dose massima "
-                f"(disavanzo: {deficit:.4f}). Niente da bilanciare.",
+                self, "Nessun bilanciamento necessario",
+                f"Il prodotto '{nome_prodotto}' è entro i limiti d'etichetta "
+                f"(sovradose: {sovradose:.4f}, sottodose: {sottodose:.4f}).",
             )
 
     def _annulla_bilanciamento(self):
@@ -906,6 +1690,11 @@ class DialogStoricoProdottiTendone(QDialog):
             """), {"p": pid}).fetchall()]
 
             conn.execute(text("DELETE FROM dettaglio_trattamenti WHERE is_bilanciamento = 1 AND trattamento_id IN (SELECT id FROM trattamenti WHERE prodotto_id = :p)"), {"p": pid})
+
+            # Annulla bilanciamenti = aggiorna fittizio dei trattamenti
+            # toccati (sono tutti revisionati: il reale è congelato).
+            for tid in tratt_ids_toccati:
+                scarica_fittizio(conn, tid)
 
         # Per ogni trattamento toccato, accoda un UPDATE col nuovo set di dettagli
         for tid in tratt_ids_toccati:
@@ -1106,9 +1895,9 @@ class DialogNuovoTrattamento(QDialog):
                 if payload:
                     enqueue_operation(conn, "TRATTAMENTO", "INSERT", entity_id=tratt_id, payload=payload)
 
-                # NOTA: lo scarico magazzino è ora server-side: quando il backend
-                # riceve l'INSERT del trattamento, esegue sincronizza_scarico e
-                # popola registro_magazzino. Il client lo riceve al pull successivo.
+                # Scarico magazzino nel REALE (il trattamento è in Storico,
+                # is_aut=0). Il fittizio verrà popolato solo alla revisione.
+                scarica_reale(conn, tratt_id)
                 ricalcola_avvisi_globali(conn)
 
             # Riabilita il timer (usa CONFIG.autosync_ms, non un valore hardcoded
@@ -1242,9 +2031,16 @@ class DialogModificaTrattamento(DialogNuovoTrattamento):
                 enqueue_operation(self.engine, "TRATTAMENTO", "UPDATE",
                                   entity_id=self.trattamento_id, payload=payload)
 
-            # NOTA: lo scarico magazzino è ora server-side. Il backend, al PUT
-            # del trattamento, ricalcola via sincronizza_scarico e aggiorna
-            # registro_magazzino. Il client lo pulla via /magazzino.
+            # Aggiorna lo scarico magazzino nel registro appropriato in base
+            # allo stato is_autorizzato del trattamento.
+            with self.engine.begin() as conn:
+                is_aut = conn.execute(text(
+                    "SELECT is_autorizzato FROM trattamenti WHERE id = :id"
+                ), {"id": self.trattamento_id}).scalar() or 0
+                if is_aut == 0:
+                    scarica_reale(conn, self.trattamento_id)
+                else:
+                    scarica_fittizio(conn, self.trattamento_id)
 
             ricalcola_avvisi_globali(self.engine)
             self.accept()

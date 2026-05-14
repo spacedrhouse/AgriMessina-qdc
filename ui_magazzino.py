@@ -260,18 +260,28 @@ class DialogModificaMovimento(QDialog):
 
 class DialogRegistroProdotto(QDialog):
     def __init__(self, engine, db, prodotto_id, nome_prodotto, um, parent=None,
-                 azienda_filter: str | None = None, azienda_ids: list | None = None):
+                 azienda_filter: str | None = None, azienda_ids: list | None = None,
+                 mostra_fittizio: bool = False):
         super().__init__(parent)
         self.engine, self.db = engine, db
         self.prodotto_id, self.um = prodotto_id, str(um or "")
         self.azienda_filter = azienda_filter
         self.azienda_ids = azienda_ids or []
+        # In modalità fittizio il dialog è READ-ONLY: il fittizio è alimentato
+        # solo automaticamente (dai trattamenti revisionati). Nessuna scrittura
+        # manuale è permessa.
+        self.mostra_fittizio = mostra_fittizio
+        self.tabella = "registro_magazzino_fittizio" if mostra_fittizio \
+            else "registro_magazzino"
 
         # --- ESTRAIAMO L'UNITÀ DI MISURA ASSOLUTA (es. da "kg/ha" a "kg") ---
         self.um_pulita = self.um.split('/')[0].strip() if '/' in self.um else self.um
 
+        suffisso = " — Fittizio" if mostra_fittizio else ""
         titolo_filter = f" ({azienda_filter})" if azienda_filter else ""
-        self.setWindowTitle(f"Registro Carico/Scarico — {nome_prodotto}{titolo_filter}")
+        self.setWindowTitle(
+            f"Registro Carico/Scarico — {nome_prodotto}{titolo_filter}{suffisso}"
+        )
         self.setMinimumSize(950, 500)
 
         layout = QVBoxLayout(self)
@@ -291,6 +301,12 @@ class DialogRegistroProdotto(QDialog):
         btn_nuovo.clicked.connect(self._nuovo_movimento)
         btn_modifica.clicked.connect(self._modifica_movimento)
         btn_elimina.clicked.connect(self._elimina_movimento)
+        # Read-only in vista fittizio
+        if self.mostra_fittizio:
+            for b in (btn_nuovo, btn_modifica, btn_elimina):
+                b.setEnabled(False)
+                b.setToolTip("Il magazzino fittizio è in sola lettura: "
+                             "si popola solo automaticamente dai trattamenti revisionati.")
         h_tool.addWidget(btn_nuovo); h_tool.addWidget(btn_modifica); h_tool.addWidget(btn_elimina); h_tool.addStretch()
         layout.addLayout(h_tool)
 
@@ -315,7 +331,7 @@ class DialogRegistroProdotto(QDialog):
         with self.engine.connect() as conn:
             giacenza = conn.execute(text(f"""
                 SELECT SUM(CASE WHEN rm.tipo_movimento = 'CARICO' THEN rm.quantita ELSE -rm.quantita END)
-                FROM registro_magazzino rm
+                FROM {self.tabella} rm
                 WHERE rm.prodotto_id = :pid {clausola_az}
             """), {"pid": self.prodotto_id}).scalar() or 0.0
 
@@ -336,7 +352,7 @@ class DialogRegistroProdotto(QDialog):
                    rm.quantita AS "Quantità ({self.um_pulita})",
                    rm.n_ddt AS "N. DDT", rm.fornitore AS "Fornitore",
                    rm.note AS "Note", rm.azienda_id
-            FROM registro_magazzino rm
+            FROM {self.tabella} rm
             LEFT JOIN aziende az_wh ON az_wh.id = rm.azienda_id
             LEFT JOIN aziende az_orig ON az_orig.id = rm.azienda_id_origine
             WHERE rm.prodotto_id = {self.prodotto_id} {clausola_az}
@@ -420,24 +436,48 @@ class PannelloProdotti(PannelloBaseDialog):
         self.azienda_filter = azienda_filter
         self.azienda_ids = self._resolve_filter_ids()  # lista per IN clause SQL
 
-        # Lo scarico magazzino è server-authoritative: il backend chiama
-        # magazzino_calculator.sincronizza_scarico ad ogni write di trattamento.
-        # Il desktop si limita a sync.
+        # Toggle reale ↔ fittizio. False = reale (default), True = fittizio.
+        # In modalità fittizio i bottoni di modifica manuale sono disabilitati:
+        # il fittizio è popolato solo automaticamente dai trattamenti revisionati.
+        self.mostra_fittizio = False
+
         self.btn_export_tutti_mov = QPushButton("📊 Esporta Movimenti")
         self.btn_export_tutti_mov.setProperty('class', 'success')
         self.btn_export_tutti_mov.clicked.connect(self._esporta_tutti_movimenti)
 
-        # Rebuild manuale degli scarichi automatici (per ripulire inconsistenze):
-        # delega al server tramite POST /magazzino/ricalcola, poi pulla.
+        # Rebuild locale degli scarichi automatici in entrambi i registri.
         self.btn_ricalcola = QPushButton("🔧 Ricalcola scarichi")
         self.btn_ricalcola.setProperty('class', 'warning')
         self.btn_ricalcola.clicked.connect(self._ricalcola_scarichi)
 
+        # Toggle reale ↔ fittizio. Classe `secondary` (blu): nel QSS globale
+        # esistono solo success/warning/danger/secondary; "primary" non c'è e
+        # ricadeva nel default Qt fuori standard.
+        self.btn_toggle_fittizio = QPushButton("📋 Mostra Fittizio")
+        self.btn_toggle_fittizio.setProperty('class', 'secondary')
+        self.btn_toggle_fittizio.clicked.connect(self._toggle_fittizio)
+
         top_layout = self.layout().itemAt(0).layout()
         top_layout.insertWidget(4, self.btn_export_tutti_mov)
         top_layout.insertWidget(5, self.btn_ricalcola)
+        top_layout.insertWidget(6, self.btn_toggle_fittizio)
 
         self.vista.doubleClicked.connect(self._on_doppio_click)
+        self.aggiorna_dati()
+
+    def _tabella(self) -> str:
+        """Nome SQL della tabella di lettura corrente (reale o fittizio).
+        Le scritture manuali vanno sempre nel reale e sono bloccate in
+        modalità fittizio (vedi DialogRegistroProdotto)."""
+        return "registro_magazzino_fittizio" if self.mostra_fittizio \
+            else "registro_magazzino"
+
+    def _toggle_fittizio(self):
+        self.mostra_fittizio = not self.mostra_fittizio
+        if self.mostra_fittizio:
+            self.btn_toggle_fittizio.setText("📦 Mostra Reale")
+        else:
+            self.btn_toggle_fittizio.setText("📋 Mostra Fittizio")
         self.aggiorna_dati()
 
     def _resolve_filter_ids(self) -> list[int]:
@@ -474,13 +514,15 @@ class PannelloProdotti(PannelloBaseDialog):
         return f"AND {table_alias}.azienda_id IN ({ids_str})"
 
     def aggiorna_dati(self):
-        giacenza_label = f"Giacenza ({self.azienda_filter})"
+        suffisso = " — Fittizio" if self.mostra_fittizio else ""
+        giacenza_label = f"Giacenza ({self.azienda_filter}){suffisso}"
         clausola_az = self._where_azienda_clause("rm")  # es. "AND rm.azienda_id IN (1,5)"
+        tabella = self._tabella()
         query = f"""
             SELECT p.id, p.nome_prodotto AS "Nome Prodotto",
                    ROUND(COALESCE((
                        SELECT SUM(CASE WHEN rm.tipo_movimento = 'CARICO' THEN rm.quantita ELSE -rm.quantita END)
-                       FROM registro_magazzino rm
+                       FROM {tabella} rm
                        WHERE rm.prodotto_id = p.id {clausola_az}
                    ), 0), 4) AS "{giacenza_label}",
                    p.categoria AS "Categoria", p.unita_misura AS "Unità", p.numero_registrazione AS "N. Registrazione",
@@ -493,47 +535,31 @@ class PannelloProdotti(PannelloBaseDialog):
         self.vista.resizeColumnsToContents()
 
     def _ricalcola_scarichi(self):
-        """Rebuild manuale di tutti gli scarichi automatici. Utile dopo bug o
-        importazioni incoerenti. I CARICHI manuali non vengono toccati.
+        """Rebuild manuale degli scarichi automatici in ENTRAMBI i registri.
 
-        Delega al server tramite POST /magazzino/ricalcola: cancella tutti gli
-        scarichi server-side con trattamento_id valorizzato e li ricrea. Subito
-        dopo pulla con sync_all per allineare il locale, altrimenti gli
-        scarichi appena ricostruiti restano invisibili (e al prossimo sync
-        automatico verrebbero comunque sincronizzati ma con ID nuovi, lasciando
-        quelli vecchi come orfani nel locale).
+        Cancella tutte le righe con trattamento_id e ricostruisce dai
+        trattamenti correnti: il reale dai dt non-bilanciamento (qta originale),
+        il fittizio dai dt completi (qta corrente). I CARICHI/SCARICHI manuali
+        non vengono toccati.
         """
         if QMessageBox.question(
             self, "Ricalcola scarichi",
-            "Vuoi davvero ricalcolare TUTTI gli scarichi automatici sul server?\n\n"
-            "Il backend cancellerà ogni scarico con trattamento_id valorizzato "
-            "e lo ricostruirà da zero in base ai trattamenti correnti. Subito "
-            "dopo verrà fatto un sync per allineare il locale.\n\n"
+            "Vuoi davvero ricalcolare TUTTI gli scarichi automatici dei due registri?\n\n"
+            "Le righe con trattamento_id verranno cancellate e ricostruite a "
+            "partire dai trattamenti correnti.\n\n"
             "I CARICHI manuali NON verranno toccati.",
             QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
             QMessageBox.StandardButton.No,
         ) != QMessageBox.StandardButton.Yes:
             return
         try:
-            # 1. Server-side rebuild. Crea anche i tombstone per gli ID
-            # cancellati (vedi app/magazzino_calculator.sincronizza_scarico_globale).
-            esito = self.api.ricalcola_scarichi()
-            n_del = esito.get("eliminati", 0)
-            n_ric = esito.get("ricalcolati", 0)
-
-            # 2. Reconcile: pulla l'elenco completo dal server (since=None) e
-            # fa phantom-delete dei record locali non presenti server-side.
-            # Più robusto di sync_all per questo caso, perché copre anche lo
-            # scenario in cui i tombstone non siano arrivati (es. backend vecchio).
-            from sync import reconcile_with_server
-            reconcile_with_server(self.api, self.engine)
-
+            from magazzino_logic import ricalcola_tutti
+            esito = ricalcola_tutti(self.engine)
             self.aggiorna_dati()
             QMessageBox.information(
                 self, "Ricalcolo completato",
-                f"Server: eliminati {n_del} scarichi automatici, "
-                f"ricalcolati {n_ric} trattamenti.\n"
-                f"Locale ri-sincronizzato.",
+                f"Ricalcolati {esito['reale']} trattamenti nel reale, "
+                f"{esito['fittizio']} nel fittizio.",
             )
         except Exception as e:
             QMessageBox.critical(self, "Errore", f"Ricalcolo fallito:\n{e}")
@@ -572,7 +598,7 @@ class PannelloProdotti(PannelloBaseDialog):
                         rm.tipo_movimento AS "Tipo",
                         rm.quantita AS _qta_raw,
                         p.unita_misura AS _um
-                    FROM registro_magazzino rm
+                    FROM {self._tabella()} rm
                     JOIN prodotti p ON p.id = rm.prodotto_id
                     LEFT JOIN aziende az_wh ON az_wh.id = rm.azienda_id
                     LEFT JOIN aziende az_orig ON az_orig.id = rm.azienda_id_origine
@@ -681,6 +707,7 @@ class PannelloProdotti(PannelloBaseDialog):
             r.value("Nome Prodotto"), r.value("Unità"), self,
             azienda_filter=self.azienda_filter,
             azienda_ids=self.azienda_ids,
+            mostra_fittizio=self.mostra_fittizio,
         ).exec()
         self.aggiorna_dati()
 

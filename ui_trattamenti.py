@@ -146,6 +146,19 @@ class WidgetSottoCardBilanciamento(QFrame):
         """)
         layout.addWidget(lbl_tipo)
 
+        # ID del sub-trattamento. Stesso badge style della card principale.
+        # Senza questo, l'utente vede solo l'ID del padre nel campo Operatore
+        # (es. "SISTEMA: BILANCIAMENTO [360]") e per modificare via SQL deve
+        # andare a cercare a mano nel DB. Mostrare entrambi gli ID rende
+        # subito chiaro cosa si sta guardando.
+        lbl_id_sub = QLabel(f"#{self.id_trattamento}")
+        lbl_id_sub.setStyleSheet(
+            f"color: {text_color}; font-size: 11px; "
+            f"background: rgba(0,0,0,0.08); padding: 1px 6px; "
+            f"border-radius: 8px; margin-left: 4px;"
+        )
+        layout.addWidget(lbl_id_sub)
+
         # Percorso
         lbl_percorso = QLabel(f"{riga_dati['Azienda']} › {riga_dati['Agro']} › {riga_dati['Contrada']} › {riga_dati['Tendoni']}")
         lbl_percorso.setStyleSheet(f"color: {text_color}; font-size: 12px; background: transparent;")
@@ -660,9 +673,23 @@ class SchedaOperazioni(QWidget):
                 ids_da_eliminare = list(figli_collegati) + [trattamento_id]
                 ids_str = ",".join(map(str, ids_da_eliminare))
 
-                # Pulizia tabelle collegate e testata. Lo scarico automatico è
-                # server-side: alla DELETE via API il CASCADE FK lato server
-                # pulisce registro_magazzino; il client lo riceve al pull.
+                # Pulisci il registro magazzino prima del DELETE: per ogni
+                # trattamento, cancella le righe dal registro in cui erano
+                # (reale se in Storico, fittizio se in Revisionati). Il
+                # registro "non coinvolto" resta intatto (es. reale di un
+                # Revisionato eliminato → snapshot conservato).
+                from magazzino_logic import (
+                    cancella_scarico_reale, cancella_scarico_fittizio,
+                )
+                stati = dict(conn.execute(text(
+                    f"SELECT id, is_autorizzato FROM trattamenti WHERE id IN ({ids_str})"
+                )).fetchall())
+                for tid in ids_da_eliminare:
+                    if stati.get(tid, 0) == 0:
+                        cancella_scarico_reale(conn, tid)
+                    else:
+                        cancella_scarico_fittizio(conn, tid)
+
                 conn.execute(text(f"DELETE FROM dettaglio_trattamenti WHERE trattamento_id IN ({ids_str})"))
                 conn.execute(text(f"DELETE FROM avvisi_trattamenti WHERE trattamento_id IN ({ids_str})"))
                 conn.execute(text(f"DELETE FROM trattamenti WHERE id IN ({ids_str})"))
@@ -720,6 +747,11 @@ class SchedaOperazioni(QWidget):
                     text("UPDATE trattamenti SET is_autorizzato = 1 WHERE id = :id"),
                     {"id": trattamento_id},
                 )
+                # Doppio scarico: il reale resta com'è (creato durante Storico),
+                # il fittizio riceve ora il proprio scarico iniziale con la
+                # qta corrente (incluso eventuali bilanciamenti già applicati).
+                from magazzino_logic import scarica_fittizio
+                scarica_fittizio(conn, trattamento_id)
 
             # Usa l'endpoint dedicato /trattamenti/{id}/autorizza invece di UPDATE
             # generico: evita di rispedire l'intero payload (incluso dettagli)
@@ -1439,8 +1471,20 @@ class SchedaOperazioni(QWidget):
                 ids_da_eliminare = self._selezionati | figli_collegati
                 ids_str = ",".join(map(str, ids_da_eliminare))
 
-                # Eliminazione tabelle. Lo storno magazzino è server-side via
-                # CASCADE FK alla DELETE del trattamento via API.
+                # Pulisci il registro magazzino prima del DELETE (vedi nota
+                # in elimina_record singolo).
+                from magazzino_logic import (
+                    cancella_scarico_reale, cancella_scarico_fittizio,
+                )
+                stati = dict(conn.execute(text(
+                    f"SELECT id, is_autorizzato FROM trattamenti WHERE id IN ({ids_str})"
+                )).fetchall())
+                for tid in ids_da_eliminare:
+                    if stati.get(tid, 0) == 0:
+                        cancella_scarico_reale(conn, tid)
+                    else:
+                        cancella_scarico_fittizio(conn, tid)
+
                 conn.execute(text(f"DELETE FROM dettaglio_trattamenti WHERE trattamento_id IN ({ids_str})"))
                 conn.execute(text(f"DELETE FROM avvisi_trattamenti WHERE trattamento_id IN ({ids_str})"))
                 conn.execute(text(f"DELETE FROM trattamenti WHERE id IN ({ids_str})"))

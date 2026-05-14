@@ -442,16 +442,12 @@ class PannelloTendoni(PannelloBaseDialog):
         self.combo_filtro.currentIndexChanged.connect(self.aggiorna_dati)
 
         # --- 2. SETUP PULSANTE LISTA TRATTAMENTI ---
+        # Stessa classe blu (`secondary`) usata da Aggiorna/Mostra Fittizio
+        # per dimensioni e padding coerenti con gli altri pulsanti toolbar.
+        # In passato lo style era inline con padding/border-radius più piccoli
+        # e disallineava il pulsante visivamente.
         self.btn_lista = QPushButton("📋 Lista Trattamenti")
-
-        # Applichiamo direttamente lo stile CSS per garantire che sia colorato (Blu in stile 'Primary')
-        self.btn_lista.setStyleSheet("""
-            QPushButton {
-                background-color: #1976D2; color: white; border: none;
-                padding: 6px 12px; border-radius: 4px; font-weight: bold;
-            }
-            QPushButton:hover { background-color: #1565C0; }
-        """)
+        self.btn_lista.setProperty('class', 'secondary')
 
         # Colleghiamo il click alla nuova funzione "interruttore"
         self.btn_lista.clicked.connect(self._toggle_vista)
@@ -504,7 +500,7 @@ class PannelloTendoni(PannelloBaseDialog):
         # Passiamo l'id prodotto solo se siamo in modalità analisi e c'è una selezione
         prod_id = self.combo_filtro.currentData() if self.modalita_analisi else None
 
-        from ui_trattamenti import DialogStoricoProdottiTendone
+        from ui_trattamenti_dialogs import DialogStoricoProdottiTendone
         DialogStoricoProdottiTendone(self.engine, riga.value("id"), riga.value("Codice"), riga.value("Superficie (ha)"), prod_id, self).exec()
 
     def aggiorna_dati(self):
@@ -519,19 +515,37 @@ class PannelloTendoni(PannelloBaseDialog):
             # Se prod_id è None ("Nessuna Selezione"), il filtro_sql è vuoto e calcola per TUTTI i prodotti
             filtro_sql = f"WHERE tr.prodotto_id = {prod_id}" if prod_id else ""
 
+            # Per i prodotti /hl il volume d'acqua va calcolato dalle BOTTI
+            # REALI (b_tot × 10 hl): è quel che l'operatore ha effettivamente
+            # versato in campo. Solo come fallback (b_tot=0, record incompleti)
+            # ricorriamo alla stima teorica ettari × qta_acqua/100. Usare la
+            # stima teorica quando ci sono botti reali altera vistosamente
+            # rimanenza e dose cumulativa (es. 1 botte = 10 hl reali ma
+            # ettari × 1000/100 può dare 5–7 hl stimati).
             query = f"""
                 SELECT t.id, az.nome AS "Azienda", ag.nome AS "Agro", c.nome AS "Contrada", t.codice AS "Codice", t.contrada_id, t.ettari AS "Superficie (ha)",
                        p.nome_prodotto AS "Prodotto",
-                       ROUND(((CASE WHEN p.unita_misura LIKE '%/hl' THEN p.max_sostanza * (sp.q_acq / 100.0) ELSE p.max_sostanza END) * t.ettari) - sp.q_usata, 4) AS "Rimanenza",
+                       ROUND(
+                           (CASE
+                               WHEN p.unita_misura LIKE '%/hl' THEN
+                                   p.max_sostanza * (CASE WHEN sp.b_tot > 0
+                                                          THEN sp.b_tot * 10.0
+                                                          ELSE t.ettari * (sp.q_acq / 100.0)
+                                                     END)
+                               ELSE
+                                   p.max_sostanza * t.ettari
+                            END) - sp.q_usata,
+                       4) AS "Rimanenza",
                        CASE
                            WHEN sp.q_usata IS NULL THEN 0
 
-                           -- CASO 1: Prodotti in concentrazione (es. g/hl)
+                           -- CASO 1: Prodotti in concentrazione (es. g/hl).
+                           -- Divisore = ettolitri d'acqua effettivi (botti×10)
+                           -- con fallback al volume teorico.
                            WHEN p.unita_misura LIKE '%/hl' THEN
                                CASE
-                                   -- USIAMO IL VOLUME TEORICO (Ettari * volume per ettaro) IGNORANDO LE BOTTI REALI
-                                   WHEN p.max_sostanza > 0 AND (ROUND(sp.q_usata / (t.ettari * (sp.q_acq / 100.0)), 4) > p.max_sostanza) THEN 2
-                                   WHEN p.min_sostanza > 0 AND (ROUND(sp.q_usata / (t.ettari * (sp.q_acq / 100.0)), 4) < p.min_sostanza) THEN 3
+                                   WHEN p.max_sostanza > 0 AND (ROUND(sp.q_usata / (CASE WHEN sp.b_tot > 0 THEN sp.b_tot * 10.0 ELSE t.ettari * (sp.q_acq / 100.0) END), 4) > p.max_sostanza) THEN 2
+                                   WHEN p.min_sostanza > 0 AND (ROUND(sp.q_usata / (CASE WHEN sp.b_tot > 0 THEN sp.b_tot * 10.0 ELSE t.ettari * (sp.q_acq / 100.0) END), 4) < p.min_sostanza) THEN 3
                                    ELSE 1
                                END
 
@@ -554,6 +568,7 @@ class PannelloTendoni(PannelloBaseDialog):
                     JOIN prodotti p2 ON p2.id = tr.prodotto_id
                     {filtro_sql}
                     GROUP BY dt.tendone_id, tr.prodotto_id
+                    HAVING SUM(dt.quantita_sostanza) > 0
                 ) sp ON sp.tendone_id = t.id
                 JOIN prodotti p ON p.id = sp.prodotto_id
                 ORDER BY az.nome, ag.nome, c.nome, t.codice, p.nome_prodotto

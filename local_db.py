@@ -157,6 +157,46 @@ def init_local_database(engine: Engine) -> None:
             "CREATE INDEX IF NOT EXISTS idx_rm_trattamento ON registro_magazzino(trattamento_id)"
         ))
 
+        # MAGAZZINO FITTIZIO — schema identico al reale ma LOCAL-ONLY.
+        #
+        # Modello a due registri:
+        #   • registro_magazzino           = REALE (Storico, is_autorizzato=0)
+        #     Popolato all'INSERT/UPDATE del trattamento con qta originale
+        #     (dt.is_bilanciamento=0). Sincronizzato col backend (per CARICHI
+        #     manuali); gli SCARICHI automatici sono derivati e ricalcolati
+        #     localmente. Si CONGELA al passaggio a Revisionati.
+        #
+        #   • registro_magazzino_fittizio  = FITTIZIO (Revisionati, is_aut=1)
+        #     Popolato dal momento della REVISIONE in poi: scarico iniziale
+        #     con qta corrente (incluso bilanciamenti applicati) + ogni
+        #     bilanciamento successivo. Local-only, mai sincronizzato. Nessun
+        #     CARICO manuale (UI read-only): si popola solo automaticamente.
+        conn.execute(text("""CREATE TABLE IF NOT EXISTS registro_magazzino_fittizio (
+            id INTEGER PRIMARY KEY,
+            prodotto_id INTEGER REFERENCES prodotti(id) ON DELETE CASCADE,
+            trattamento_id INTEGER REFERENCES trattamenti(id) ON DELETE CASCADE ON UPDATE CASCADE,
+            azienda_id INTEGER REFERENCES aziende(id),
+            azienda_id_origine INTEGER REFERENCES aziende(id),
+            data_movimento DATE NOT NULL,
+            tipo_movimento TEXT NOT NULL,
+            quantita REAL NOT NULL,
+            n_ddt TEXT,
+            fornitore TEXT,
+            note TEXT
+        )"""))
+        conn.execute(text(
+            "CREATE INDEX IF NOT EXISTS idx_rmf_azienda ON registro_magazzino_fittizio(azienda_id)"
+        ))
+        conn.execute(text(
+            "CREATE INDEX IF NOT EXISTS idx_rmf_azienda_origine ON registro_magazzino_fittizio(azienda_id_origine)"
+        ))
+        conn.execute(text(
+            "CREATE INDEX IF NOT EXISTS idx_rmf_prodotto ON registro_magazzino_fittizio(prodotto_id)"
+        ))
+        conn.execute(text(
+            "CREATE INDEX IF NOT EXISTS idx_rmf_trattamento ON registro_magazzino_fittizio(trattamento_id)"
+        ))
+
         # Avvisi (calcolati localmente con la stessa logica del backend desktop)
         conn.execute(text("""CREATE TABLE IF NOT EXISTS avvisi_trattamenti (
             id INTEGER PRIMARY KEY,

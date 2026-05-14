@@ -1054,6 +1054,20 @@ def run():
     from migrations import apply_pending_migrations
     apply_pending_migrations(engine)
 
+    # One-shot di bootstrap del modello a due registri (reale + fittizio).
+    # Per i DB pre-esistenti ricostruisce gli scarichi automatici nei due
+    # registri partendo dai trattamenti correnti. Idempotente: marker
+    # `_sync_flags.bootstrap_due_registri_v2_done`. No-op se già eseguito o
+    # se non ci sono trattamenti.
+    try:
+        from magazzino_logic import bootstrap_due_registri_once
+        esito = bootstrap_due_registri_once(engine)
+        if esito is not None:
+            log.info("bootstrap_due_registri: reale=%d, fittizio=%d trattamenti",
+                     esito["reale"], esito["fittizio"])
+    except Exception:
+        log.exception("bootstrap_due_registri fallito; saltato")
+
     # 2. API client (con eventuale token già salvato)
     api = ApiClient(get_api_base_url())
 
