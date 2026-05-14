@@ -90,6 +90,39 @@ STYLE_AGRIMESSINA = """
         border-top-left-radius: 10px;
     }
 
+    /* --- CALENDARIO (QDateEdit popup) ---
+       QCalendarWidget usa internamente una QTableView per la griglia dei
+       giorni. Le regole globali su QTableView/::item (padding 8/10 e
+       border-bottom) gonfiano le celle e fanno sparire i numeri sotto la
+       riga successiva. Resettiamo gli stili solo per la tabella DEL
+       calendario, lasciando intatte le tabelle "vere". */
+    QCalendarWidget QTableView {
+        background-color: #FFFFFF;
+        alternate-background-color: #FFFFFF;
+        selection-background-color: #C8E6C9;
+        selection-color: #1B5E20;
+        gridline-color: transparent;
+        border: none;
+        border-radius: 0;
+        font-size: 13px;
+        color: #212121;
+        outline: 0;
+    }
+
+    QCalendarWidget QTableView::item {
+        padding: 0;
+        border: none;
+    }
+
+    QCalendarWidget QTableView::item:selected {
+        background-color: #C8E6C9;
+        color: #1B5E20;
+    }
+
+    QCalendarWidget QTableView::item:hover {
+        background-color: #F1F8E9;
+    }
+
     #Sidebar {
         background-color: #FFFFFF;
         border-right: 1px solid #E0E0E0;

@@ -1,6 +1,6 @@
 from sqlalchemy import text
 from PyQt6.QtWidgets import (QVBoxLayout, QHBoxLayout, QPushButton, QMessageBox,
-                             QComboBox, QLabel, QLineEdit, QInputDialog,
+                             QLabel, QLineEdit,
                              QWidget, QFileDialog,
                              QFrame, QScrollArea,
                              QCheckBox, QDateEdit)
@@ -432,65 +432,33 @@ class SchedaOperazioni(QWidget):
         )
         h_filtri.addWidget(self.search_bar, stretch=1)
 
-        # Combo per recall rapido dei filtri salvati. La prima voce
-        # "(nessuno)" è un placeholder = nessun filtro applicato.
-        self._QInputDialog = QInputDialog  # ref per save_filter
-        self.combo_filtri = QComboBox()
-        self.combo_filtri.setObjectName("FiltriSalvati")
-        self.combo_filtri.setMinimumWidth(200)
-        self.combo_filtri.setToolTip("Filtri salvati: seleziona per applicare")
-        self.combo_filtri.currentIndexChanged.connect(self._applica_filtro_salvato)
-        h_filtri.addWidget(self.combo_filtri)
-
-        self.btn_save_filter = QPushButton("💾")
-        self.btn_save_filter.setToolTip("Salva il filtro corrente con un nome")
-        self.btn_save_filter.setFixedWidth(36)
-        self.btn_save_filter.clicked.connect(self._salva_filtro)
-        h_filtri.addWidget(self.btn_save_filter)
-
-        self.btn_del_filter = QPushButton("🗑️")
-        self.btn_del_filter.setToolTip("Elimina il filtro selezionato")
-        self.btn_del_filter.setFixedWidth(36)
-        self.btn_del_filter.clicked.connect(self._elimina_filtro_salvato)
-        h_filtri.addWidget(self.btn_del_filter)
-
-        # Carica i filtri salvati per questo tipo_vista (Storico/Revisionati
-        # hanno liste separate).
-        self._ricarica_combo_filtri()
-
-        # --- FILTRO PERIODO (Da / A) ---
-        # Posizionato SOPRA la barra di ricerca/template per dare visibilità
-        # immediata al range temporale. Attivo solo quando la checkbox è
-        # spuntata; i due QDateEdit restano disabilitati altrimenti per
-        # evitare interazioni casuali. Date inclusive su entrambi i lati.
-        # Le card vengono filtrate lato SQL → "Seleziona tutto" prende
-        # automaticamente solo ciò che è nel range.
-        h_periodo = QHBoxLayout()
+        # --- FILTRO PERIODO (Da / A) — inline, prima dei filtri salvati ---
+        # Attivo solo quando la checkbox è spuntata; i due QDateEdit restano
+        # disabilitati altrimenti per evitare interazioni casuali. Date
+        # inclusive su entrambi i lati. Le card vengono filtrate lato SQL →
+        # "Seleziona tutto" prende automaticamente solo ciò che è nel range.
         self.chk_periodo = QCheckBox("📅 Periodo")
         self.chk_periodo.setToolTip("Filtra i trattamenti per intervallo di data")
         self.chk_periodo.toggled.connect(self._on_toggle_periodo)
-        h_periodo.addWidget(self.chk_periodo)
+        h_filtri.addWidget(self.chk_periodo)
 
-        h_periodo.addWidget(QLabel("Da:"))
+        h_filtri.addWidget(QLabel("Da:"))
         self.date_da = QDateEdit()
         self.date_da.setCalendarPopup(True)
         self.date_da.setDisplayFormat("dd/MM/yyyy")
         self.date_da.setDate(QDate.currentDate().addMonths(-1))
         self.date_da.setEnabled(False)
         self.date_da.dateChanged.connect(lambda _d: self._on_periodo_changed())
-        h_periodo.addWidget(self.date_da)
+        h_filtri.addWidget(self.date_da)
 
-        h_periodo.addWidget(QLabel("A:"))
+        h_filtri.addWidget(QLabel("A:"))
         self.date_a = QDateEdit()
         self.date_a.setCalendarPopup(True)
         self.date_a.setDisplayFormat("dd/MM/yyyy")
         self.date_a.setDate(QDate.currentDate())
         self.date_a.setEnabled(False)
         self.date_a.dateChanged.connect(lambda _d: self._on_periodo_changed())
-        h_periodo.addWidget(self.date_a)
-
-        h_periodo.addStretch()
-        layout.addLayout(h_periodo)
+        h_filtri.addWidget(self.date_a)
 
         layout.addLayout(h_filtri)
 
@@ -1438,99 +1406,6 @@ class SchedaOperazioni(QWidget):
             table,
         ]
         doc.build(story, onFirstPage=_draw_footer, onLaterPages=_draw_footer)
-
-    # ---- Filtri salvati ------------------------------------------------
-
-    def _filtri_key(self) -> str:
-        """Chiave QSettings sotto cui salvare i filtri di questa vista.
-        Storico/Revisionati hanno liste separate perché tipicamente l'utente
-        ha bisogni di filtraggio diversi nei due contesti."""
-        return f"saved_filters/{self.tipo_vista}"
-
-    def _settings(self):
-        """Lazy: QSettings shared di applicazione. Usa lo stesso scope di main.
-        QSettings senza args legge i defaults registrati da QApplication
-        (organization/application name) — quindi è automaticamente per-utente."""
-        from PyQt6.QtCore import QSettings
-        return QSettings("AgriMessina", "QDC")
-
-    def _carica_filtri_salvati(self) -> list[dict]:
-        """Lista di dict {nome, query}. JSON in QSettings."""
-        import json
-        raw = self._settings().value(self._filtri_key(), "[]")
-        try:
-            data = json.loads(raw) if isinstance(raw, str) else (raw or [])
-            return [d for d in data if isinstance(d, dict) and "nome" in d]
-        except (json.JSONDecodeError, TypeError):
-            return []
-
-    def _salva_filtri(self, items: list[dict]) -> None:
-        import json
-        self._settings().setValue(self._filtri_key(), json.dumps(items, ensure_ascii=False))
-
-    def _ricarica_combo_filtri(self) -> None:
-        """Ripopola la combo dai filtri salvati. La prima voce è sempre
-        '(nessuno)' = placeholder, non corrisponde a un filtro reale."""
-        self.combo_filtri.blockSignals(True)
-        self.combo_filtri.clear()
-        self.combo_filtri.addItem("(nessuno)", userData=None)
-        for f in self._carica_filtri_salvati():
-            self.combo_filtri.addItem(f["nome"], userData=f.get("query", ""))
-        self.combo_filtri.blockSignals(False)
-
-    def _applica_filtro_salvato(self, idx: int):
-        """L'utente ha selezionato un filtro dalla combo."""
-        if idx <= 0:
-            return  # "(nessuno)" → no-op
-        query = self.combo_filtri.itemData(idx)
-        if query is not None:
-            self.search_bar.setText(str(query))
-
-    def _salva_filtro(self):
-        """Chiede un nome all'utente e salva la query attuale della search_bar.
-        Se esiste già un filtro con quel nome, lo sovrascrive."""
-        query = self.search_bar.text().strip()
-        if not query:
-            QMessageBox.information(
-                self, "Filtro vuoto",
-                "Scrivi prima qualcosa nella barra di ricerca, poi salva.",
-            )
-            return
-        nome, ok = self._QInputDialog.getText(
-            self, "Salva filtro", "Nome del filtro:",
-            text=query[:30],   # suggerimento default
-        )
-        if not ok or not nome.strip():
-            return
-        nome = nome.strip()
-        items = self._carica_filtri_salvati()
-        # Upsert per nome (case-insensitive)
-        items = [f for f in items if f["nome"].lower() != nome.lower()]
-        items.append({"nome": nome, "query": query})
-        items.sort(key=lambda f: f["nome"].lower())
-        self._salva_filtri(items)
-        self._ricarica_combo_filtri()
-        # Seleziona quello appena salvato
-        idx = self.combo_filtri.findText(nome)
-        if idx > 0:
-            self.combo_filtri.setCurrentIndex(idx)
-
-    def _elimina_filtro_salvato(self):
-        idx = self.combo_filtri.currentIndex()
-        if idx <= 0:
-            return
-        nome = self.combo_filtri.itemText(idx)
-        ans = QMessageBox.question(
-            self, "Elimina filtro",
-            f"Eliminare il filtro «{nome}»?",
-            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
-        )
-        if ans != QMessageBox.StandardButton.Yes:
-            return
-        items = [f for f in self._carica_filtri_salvati()
-                 if f["nome"].lower() != nome.lower()]
-        self._salva_filtri(items)
-        self._ricarica_combo_filtri()
 
     def _elimina_selezionati(self):
         if not self._selezionati:
