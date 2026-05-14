@@ -325,9 +325,9 @@ class FinestraPrincipale(QMainWindow):
         self.pagine.addWidget(SchedaOperazioni(self.engine, self.db, tipo_vista="AUTORIZZATI", api=self.api, notifier=self.notifier))
         # Tre vedute magazzino, una per azienda. "Messina Alfio" include
         # automaticamente l'alias Deflorio Ciccopinto (vedi WAREHOUSE_ALIASES).
-        self.pagine.addWidget(PannelloProdotti(self.engine, self.db, azienda_filter="Agrimessina", api=self.api))
-        self.pagine.addWidget(PannelloProdotti(self.engine, self.db, azienda_filter="La Gazzella", api=self.api))
-        self.pagine.addWidget(PannelloProdotti(self.engine, self.db, azienda_filter="Messina Alfio", api=self.api))
+        self.pagine.addWidget(PannelloProdotti(self.engine, self.db, azienda_filter="Agrimessina"))
+        self.pagine.addWidget(PannelloProdotti(self.engine, self.db, azienda_filter="La Gazzella"))
+        self.pagine.addWidget(PannelloProdotti(self.engine, self.db, azienda_filter="Messina Alfio"))
         self.pagine.addWidget(PannelloTendoni(self.engine, self.db))
         self.pagine.addWidget(PannelloContrade(self.engine, self.db))
         self.pagine.addWidget(PannelloAgri(self.engine, self.db))
