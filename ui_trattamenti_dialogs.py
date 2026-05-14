@@ -499,15 +499,16 @@ class DialogCompensaDisavanzo(QDialog):
                     # Botti calcolate solo se creiamo una testata completamente nuova
                     botti_dest = _botti_stimate(dati['ettari'])
 
-                # `bilanciamento_group_id` lega i dt del bilanciamento (negativi
-                # sui source + positivo sul dest) al sub di destinazione SOLO
-                # quando il dest è una testata nuova (caso "sub-puro"). In quel
-                # caso l'annullamento può rimuovere tutti i dt del gruppo senza
-                # lasciare traccia. Se il dest è preesistente non popoliamo il
-                # group_id: l'eventuale rollback è il caso "revisionato vero"
-                # (UPDATE is_autorizzato=0 + delete dei soli dt bil sul target,
-                # con i negativi sui source che restano come traccia contabile).
-                group_id = tratt_id_dest if tratt_dest_was_new else None
+                # `bilanciamento_group_id` lega tutti i dt di questo bilanciamento
+                # (negativi sui source + positivo sul dest) al trattamento di
+                # destinazione. Popolato sempre, indipendentemente dal fatto che
+                # il dest sia nuovo (sub-puro) o preesistente (rev. vero):
+                # - sub-puro: il rollback rimuove l'intero gruppo senza traccia.
+                # - rev. vero: il rollback corrente non usa il group_id (lascia
+                #   i dt sui source come traccia contabile), ma popolarlo non
+                #   rompe nulla e abilita future operazioni di annullamento
+                #   selettivo del singolo bilanciamento.
+                group_id = tratt_id_dest
 
                 src_tratt_ids_modificati = []
                 for src_tratt_id, quota, _ in quote:
@@ -959,35 +960,37 @@ class DialogCompensaSottodose(QDialog):
         # prendiamo il più recente: il nuovo dt è aggregato in SUM.
         try:
             with self.engine.begin() as conn:
-                target_tratt_id = conn.execute(text("""
-                    SELECT tr.id FROM trattamenti tr
-                    JOIN dettaglio_trattamenti dt ON dt.trattamento_id = tr.id
-                    WHERE tr.prodotto_id = :pid AND dt.tendone_id = :tid
-                      AND tr.is_autorizzato = 1
-                    ORDER BY tr.data_trattamento DESC, tr.id DESC
-                    LIMIT 1
-                """), {"pid": self.prodotto_id, "tid": self.tendone_id}).scalar()
+                # Riusa il target identificato in __init__: usa il criterio
+                # allargato (revisionato vero OR sub-bilanciamento puro), così
+                # un sub-puro in sottodose può essere bilanciato via prelievo.
+                target_tratt_id = self._target_tratt_id
                 if target_tratt_id is None:
                     QMessageBox.critical(self, "Errore",
-                                         "Impossibile trovare un trattamento revisionato target.")
+                                         "Impossibile trovare un trattamento target sul tendone.")
                     return
 
                 src_tratt_ids = set()
                 for cand, qta in prelievi:
-                    # dt negativo sul source
+                    # dt negativo sul source. `bilanciamento_group_id =
+                    # target_tratt_id` lega il prelievo al target: se in futuro
+                    # si fa rollback completo del target (caso sub-puro), anche
+                    # questi dt negativi vengono identificati e rimossi senza
+                    # lasciare traccia sui nuovi source.
                     conn.execute(text("""
                         INSERT INTO dettaglio_trattamenti
-                            (trattamento_id, tendone_id, quantita_sostanza, botti, is_bilanciamento)
-                        VALUES (:tr, :te, :q, 0, 1)
-                    """), {"tr": cand["tratt_id"], "te": cand["tendone_id"], "q": -qta})
+                            (trattamento_id, tendone_id, quantita_sostanza, botti, is_bilanciamento, bilanciamento_group_id)
+                        VALUES (:tr, :te, :q, 0, 1, :gid)
+                    """), {"tr": cand["tratt_id"], "te": cand["tendone_id"],
+                           "q": -qta, "gid": target_tratt_id})
                     src_tratt_ids.add(cand["tratt_id"])
 
                 # dt positivo aggregato sul target
                 conn.execute(text("""
                     INSERT INTO dettaglio_trattamenti
-                        (trattamento_id, tendone_id, quantita_sostanza, botti, is_bilanciamento)
-                    VALUES (:tr, :te, :q, 0, 1)
-                """), {"tr": target_tratt_id, "te": self.tendone_id, "q": totale})
+                        (trattamento_id, tendone_id, quantita_sostanza, botti, is_bilanciamento, bilanciamento_group_id)
+                    VALUES (:tr, :te, :q, 0, 1, :gid)
+                """), {"tr": target_tratt_id, "te": self.tendone_id,
+                       "q": totale, "gid": target_tratt_id})
 
                 # Ricalcola scarichi fittizi per tutti i trattamenti toccati.
                 # Il reale NON viene toccato (nessuna chiamata a scarica_reale).
@@ -1033,6 +1036,22 @@ class DialogCompensaSottodose(QDialog):
             layout.addWidget(QLabel(
                 "<b>Nessun tendone candidato per uno spostamento.</b>"
             ))
+            # Caso anomalo: dialog aperto ma nessun trattamento target
+            # identificato (es. dati corrotti, race con altro client). Niente
+            # pulsante di rollback — chiude e basta. Il check a monte in
+            # `_apri_compensazione` dovrebbe già aver bloccato questo caso.
+            if not self._target_tratt_id:
+                layout.addWidget(QLabel(
+                    "Nessun trattamento revisionato identificabile su questo "
+                    "tendone. Chiudi e riapri il dialog per aggiornare lo stato."
+                ))
+                btns = QHBoxLayout()
+                btns.addStretch()
+                btn_chiudi = QPushButton("Chiudi")
+                btn_chiudi.clicked.connect(self.reject)
+                btns.addWidget(btn_chiudi)
+                layout.addLayout(btns)
+                return
             um_simple = self.um.split('/')[0]
             if self._target_is_sub_puro:
                 # Sub-bilanciamento puro: non è una proposta promossa a
@@ -1141,14 +1160,24 @@ class DialogCompensaSottodose(QDialog):
         try:
             with self.engine.begin() as conn:
                 # Trova trattamenti revisionati con dt sul tendone corrente
-                # per questo prodotto. Possono essercene più di uno: spostiamo
-                # tutti i loro dt sul nuovo tendone.
+                # per questo prodotto. Stessa logica del check `n_revisionati`:
+                # accettiamo sia revisionato vero (is_autorizzato=1) sia
+                # sub-bilanciamento puro (tutti dt is_bilanciamento=1) — quest
+                # ultimo può comparire come is_autorizzato=0 per dati legacy
+                # pre-Fix 1 o dopo resync. Senza l'allargamento, un sub-puro
+                # legacy in sottodose senza candidati source ma con tendone
+                # alternativo bloccava lo spostamento.
                 tratt_ids = [r[0] for r in conn.execute(text("""
                     SELECT DISTINCT tr.id
                     FROM trattamenti tr
                     JOIN dettaglio_trattamenti dt ON dt.trattamento_id = tr.id
                     WHERE tr.prodotto_id = :pid AND dt.tendone_id = :tid
-                      AND tr.is_autorizzato = 1
+                      AND (
+                        tr.is_autorizzato = 1
+                        OR (SELECT MIN(COALESCE(dt2.is_bilanciamento, 0))
+                            FROM dettaglio_trattamenti dt2
+                            WHERE dt2.trattamento_id = tr.id) = 1
+                      )
                 """), {"pid": self.prodotto_id, "tid": self.tendone_id}).fetchall()]
 
                 if not tratt_ids:
@@ -1247,6 +1276,24 @@ class DialogCompensaSottodose(QDialog):
         if not self._target_tratt_id:
             QMessageBox.critical(self, "Errore",
                                  "Trattamento target non trovato.")
+            return
+
+        # Race: tra l'apertura del dialog (__init__) e il click di rollback può
+        # essere passato tempo, e nel mentre un resync o un'altra UI potrebbe
+        # aver eliminato la testata. Senza questo check il DELETE è no-op e i
+        # successivi scarica_fittizio sui source non vengono eseguiti perché
+        # source_ids_toccati risulta vuoto → fittizi disallineati.
+        with self.engine.connect() as conn:
+            ancora_esiste = conn.execute(text(
+                "SELECT 1 FROM trattamenti WHERE id = :id"
+            ), {"id": self._target_tratt_id}).first()
+        if not ancora_esiste:
+            QMessageBox.warning(
+                self, "Trattamento non più disponibile",
+                "Il trattamento è stato modificato o eliminato altrove. "
+                "Riapri il dialog per vedere lo stato aggiornato.",
+            )
+            self.reject()
             return
 
         um_simple = self.um.split('/')[0]

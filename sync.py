@@ -204,55 +204,54 @@ def _upsert_trattamenti(engine: Engine, items: list) -> None:
                     # il group_id e l'eventuale rollback del sub-bilanciamento
                     # degrada a parziale (dt negativi sui source non più
                     # identificabili).
-                    group_map: dict[tuple, int] = {}
+                    #
+                    # NB: la mappa è chiave → list[group_id], per supportare il
+                    # caso (raro) di più dt con la stessa chiave sullo stesso
+                    # trattamento. L'ordine di inserimento è quello dell'id
+                    # crescente locale (rispecchia l'ordine cronologico).
+                    group_map: dict[tuple, list[int]] = {}
                     for r in conn.execute(text(
                         "SELECT tendone_id, quantita_sostanza, "
                         "COALESCE(is_bilanciamento, 0), bilanciamento_group_id "
-                        "FROM dettaglio_trattamenti WHERE trattamento_id = :tid"
+                        "FROM dettaglio_trattamenti WHERE trattamento_id = :tid "
+                        "ORDER BY id"
                     ), {"tid": tid}).fetchall():
                         if r[3] is not None:
-                            group_map[(r[0], round(float(r[1] or 0), 6),
-                                       int(r[2] or 0))] = int(r[3])
+                            key = (r[0], round(float(r[1] or 0), 6),
+                                   int(r[2] or 0))
+                            group_map.setdefault(key, []).append(int(r[3]))
 
                     conn.execute(text(
                         "DELETE FROM dettaglio_trattamenti WHERE trattamento_id = :tid"
                     ), {"tid": tid})
                     dettagli = t.get("dettagli") or []
                     if dettagli:
-                        conn.execute(text("""
-                            INSERT INTO dettaglio_trattamenti
-                                (trattamento_id, tendone_id, quantita_sostanza, botti, dose_ha, is_bilanciamento)
-                            VALUES (:tid, :tendone_id, :quantita_sostanza, :botti, :dose_ha, :is_bilanciamento)
-                        """), [
-                            {
+                        # INSERT one-by-one per recuperare lastrowid e assegnare
+                        # group_id al dt esatto (evita ambiguità su duplicati).
+                        for d in dettagli:
+                            res = conn.execute(text("""
+                                INSERT INTO dettaglio_trattamenti
+                                    (trattamento_id, tendone_id, quantita_sostanza, botti, dose_ha, is_bilanciamento)
+                                VALUES (:tid, :tendone_id, :quantita_sostanza, :botti, :dose_ha, :is_bilanciamento)
+                            """), {
                                 "tid": tid,
                                 "tendone_id": d.get("tendone_id"),
                                 "quantita_sostanza": d.get("quantita_sostanza", 0),
                                 "botti": d.get("botti"),
                                 "dose_ha": d.get("dose_ha"),
                                 "is_bilanciamento": d.get("is_bilanciamento", 0),
-                            }
-                            for d in dettagli
-                        ])
-                        # Riapplica i group_id memorizzati ai dt appena inseriti.
-                        for d in dettagli:
+                            })
                             key = (d.get("tendone_id"),
                                    round(float(d.get("quantita_sostanza") or 0), 6),
                                    int(d.get("is_bilanciamento") or 0))
-                            gid = group_map.get(key)
-                            if gid is not None:
-                                conn.execute(text("""
-                                    UPDATE dettaglio_trattamenti
-                                    SET bilanciamento_group_id = :gid
-                                    WHERE trattamento_id = :tid
-                                      AND tendone_id = :te
-                                      AND quantita_sostanza = :q
-                                      AND COALESCE(is_bilanciamento, 0) = :ib
-                                      AND bilanciamento_group_id IS NULL
-                                """), {"gid": gid, "tid": tid,
-                                       "te": d.get("tendone_id"),
-                                       "q": d.get("quantita_sostanza", 0),
-                                       "ib": int(d.get("is_bilanciamento") or 0)})
+                            bucket = group_map.get(key)
+                            if bucket:
+                                gid = bucket.pop(0)
+                                conn.execute(text(
+                                    "UPDATE dettaglio_trattamenti "
+                                    "SET bilanciamento_group_id = :gid "
+                                    "WHERE id = :dt_id"
+                                ), {"gid": gid, "dt_id": res.lastrowid})
             except IntegrityError as e:
                 log.warning("Scartato Trattamento corrotto dal server (ID %s): %s", tid, e)
 
