@@ -77,7 +77,47 @@ def _set_version(conn, version: int) -> None:
 # applicate a tutti gli utenti in produzione e rimosse: oggi `init_local_database`
 # crea già lo schema target. Le nuove migration partono da v3 in poi.
 
-MIGRATIONS: list[tuple[int, Callable]] = []
+
+def _migrate_v3(conn) -> None:
+    """Sana il flag is_autorizzato sui figli bilanciamento esistenti.
+
+    Storia del bug: il payload INSERT verso il backend ometteva
+    `is_autorizzato`, quindi il server creava i figli con default 0 e al
+    primo reconcile sovrascriveva il valore locale (creato a 1). Risultato:
+    i figli risultavano "in Storico" e non erano ri-bilanciabili.
+
+    Definizione di "figlio bilanciamento": un trattamento i cui dettagli
+    sono TUTTI is_bilanciamento=1 (MIN(is_bilanciamento) = 1). Sono per
+    costruzione gli output di `DialogCompensaDisavanzo`, e vivono nella
+    vista Revisionati (vedi filtro_autorizzato in ui_trattamenti.py).
+
+    Effetto: locale-only. Il server resta out-of-sync finché non passa un
+    UPDATE (e il payload UPDATE generico omette comunque is_autorizzato,
+    per non sovrascrivere autorizza/revoca da altri client). Il fix
+    applicativo a regime è in trattamenti_payload.build_trattamento_payload
+    (include_is_autorizzato=True solo su INSERT) + nel gate di
+    _apri_compensazione che ora accetta anche solo_bilanciamenti=1.
+    """
+    res = conn.execute(text("""
+        UPDATE trattamenti
+        SET is_autorizzato = 1
+        WHERE is_autorizzato = 0
+          AND id IN (
+            SELECT t.id
+            FROM trattamenti t
+            JOIN dettaglio_trattamenti dt ON dt.trattamento_id = t.id
+            GROUP BY t.id
+            HAVING MIN(COALESCE(dt.is_bilanciamento, 0)) = 1
+          )
+    """))
+    n = res.rowcount or 0
+    if n:
+        log.info("[migration v3] is_autorizzato=1 su %d figli bilanciamento", n)
+
+
+MIGRATIONS: list[tuple[int, Callable]] = [
+    (3, _migrate_v3),
+]
 
 
 def apply_pending_migrations(engine: Engine) -> int:

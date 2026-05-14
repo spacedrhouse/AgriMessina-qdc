@@ -3,8 +3,8 @@ from PyQt6.QtWidgets import (QVBoxLayout, QHBoxLayout, QPushButton, QMessageBox,
                              QComboBox, QLabel, QLineEdit, QInputDialog,
                              QWidget, QFileDialog,
                              QFrame, QScrollArea,
-                             QCheckBox)
-from PyQt6.QtCore import Qt
+                             QCheckBox, QDateEdit)
+from PyQt6.QtCore import Qt, QDate
 from PyQt6.QtGui import QColor
 from PyQt6.QtGui import QPainter, QPainterPath, QPen
 
@@ -458,6 +458,40 @@ class SchedaOperazioni(QWidget):
         # hanno liste separate).
         self._ricarica_combo_filtri()
 
+        # --- FILTRO PERIODO (Da / A) ---
+        # Posizionato SOPRA la barra di ricerca/template per dare visibilità
+        # immediata al range temporale. Attivo solo quando la checkbox è
+        # spuntata; i due QDateEdit restano disabilitati altrimenti per
+        # evitare interazioni casuali. Date inclusive su entrambi i lati.
+        # Le card vengono filtrate lato SQL → "Seleziona tutto" prende
+        # automaticamente solo ciò che è nel range.
+        h_periodo = QHBoxLayout()
+        self.chk_periodo = QCheckBox("📅 Periodo")
+        self.chk_periodo.setToolTip("Filtra i trattamenti per intervallo di data")
+        self.chk_periodo.toggled.connect(self._on_toggle_periodo)
+        h_periodo.addWidget(self.chk_periodo)
+
+        h_periodo.addWidget(QLabel("Da:"))
+        self.date_da = QDateEdit()
+        self.date_da.setCalendarPopup(True)
+        self.date_da.setDisplayFormat("dd/MM/yyyy")
+        self.date_da.setDate(QDate.currentDate().addMonths(-1))
+        self.date_da.setEnabled(False)
+        self.date_da.dateChanged.connect(lambda _d: self._on_periodo_changed())
+        h_periodo.addWidget(self.date_da)
+
+        h_periodo.addWidget(QLabel("A:"))
+        self.date_a = QDateEdit()
+        self.date_a.setCalendarPopup(True)
+        self.date_a.setDisplayFormat("dd/MM/yyyy")
+        self.date_a.setDate(QDate.currentDate())
+        self.date_a.setEnabled(False)
+        self.date_a.dateChanged.connect(lambda _d: self._on_periodo_changed())
+        h_periodo.addWidget(self.date_a)
+
+        h_periodo.addStretch()
+        layout.addLayout(h_periodo)
+
         layout.addLayout(h_filtri)
 
         # --- PULSANTI AZIONE ---
@@ -521,6 +555,19 @@ class SchedaOperazioni(QWidget):
         self.btn_elim_sel.setText(f"🗑️ ELIMINA SELEZIONATI ({len(self._selezionati)})")
         if hasattr(self, 'btn_sel_tutti'):
             self.btn_sel_tutti.setText("☑️ SELEZIONA TUTTO")
+
+    def _on_toggle_periodo(self, attivo: bool):
+        """Abilita/disabilita i due QDateEdit e rilancia il refresh."""
+        self.date_da.setEnabled(attivo)
+        self.date_a.setEnabled(attivo)
+        self.aggiorna_dati()
+
+    def _on_periodo_changed(self):
+        """Refresh solo se il filtro periodo è effettivamente attivo,
+        per evitare query ridondanti quando l'utente scorre il calendario
+        a checkbox spenta."""
+        if self.chk_periodo.isChecked():
+            self.aggiorna_dati()
 
     def _toggle_seleziona_tutto(self):
         """Seleziona tutte le card visibili, oppure deseleziona se sono già tutte selezionate."""
@@ -797,6 +844,17 @@ class SchedaOperazioni(QWidget):
             #    completamente dalla query e la sotto-card non compariva mai.
             filtro_autorizzato = "AND (t.is_autorizzato = 1 OR tg.solo_bilanciamenti = 1)"
 
+        # Filtro periodo (BETWEEN inclusivo). Solo se la checkbox è attiva.
+        params_periodo: dict[str, str] = {}
+        if self.chk_periodo.isChecked():
+            filtro_periodo = "AND t.data_trattamento BETWEEN :date_da AND :date_a"
+            params_periodo = {
+                "date_da": self.date_da.date().toString("yyyy-MM-dd"),
+                "date_a": self.date_a.date().toString("yyyy-MM-dd"),
+            }
+        else:
+            filtro_periodo = ""
+
         query_sql = f"""
             SELECT
                 t.id AS "_ID_T",
@@ -926,13 +984,14 @@ class SchedaOperazioni(QWidget):
                   ))
               AND NOT (tg.priorita_max = 5 AND :vista_corrente = 'AUTORIZZATI')
               {filtro_autorizzato}
+              {filtro_periodo}
             ORDER BY t.data_trattamento DESC, t.id DESC
         """
 
         try:
             with self.engine.connect() as conn:
                 # --- MODIFICA QUESTA RIGA ---
-                risultati = conn.execute(text(query_sql), {"vista_corrente": self.tipo_vista}).mappings().all()
+                risultati = conn.execute(text(query_sql), {"vista_corrente": self.tipo_vista, **params_periodo}).mappings().all()
 
                 trattamenti_veri = []
                 bilanciamenti_per_padre = {}
@@ -1045,6 +1104,33 @@ class SchedaOperazioni(QWidget):
             QMessageBox.warning(self, "Attenzione", "Nessun trattamento selezionato.")
             return
 
+        # In Revisionati i prodotti in blacklist NON vanno mai esportati,
+        # anche se l'utente li ha selezionati prima che il flag fosse
+        # impostato (o se è arrivato via sync). Hard-block con feedback.
+        is_revisionati = (self.tipo_vista == "AUTORIZZATI")
+        blacklist_esclusi: list[tuple[int, str]] = []
+        if is_revisionati:
+            ids_in = ",".join(str(int(i)) for i in self._selezionati)
+            with self.engine.connect() as conn:
+                rows = conn.execute(text(f"""
+                    SELECT t.id, p.nome_prodotto
+                    FROM trattamenti t
+                    JOIN prodotti p ON p.id = t.prodotto_id
+                    WHERE t.id IN ({ids_in})
+                      AND LOWER(TRIM(COALESCE(p.blacklist, ''))) = 'si'
+                """)).fetchall()
+                blacklist_esclusi = [(int(r[0]), r[1] or "") for r in rows]
+            if len(blacklist_esclusi) == len(self._selezionati):
+                nomi = ", ".join(sorted({n for _, n in blacklist_esclusi if n}))
+                QMessageBox.warning(
+                    self, "Esportazione bloccata",
+                    "Tutti i trattamenti selezionati hanno prodotti in "
+                    f"blacklist ({nomi}) e non possono essere esportati.",
+                )
+                return
+
+        ids_da_esportare = self._selezionati - {bid for bid, _ in blacklist_esclusi}
+
         suffisso = "Storico" if self.tipo_vista == "PROPOSTE" else "Revisionati"
         nome_default = f"Trattamenti_{suffisso}.xlsx"
 
@@ -1073,11 +1159,10 @@ class SchedaOperazioni(QWidget):
             from datetime import timedelta
 
             with self.engine.connect() as conn:
-                ids_str = ",".join(map(str, self._selezionati))
+                ids_str = ",".join(map(str, ids_da_esportare))
 
                 # Flag per la vista: in Revisionati usiamo dose netta + qta netta + botti totali (post-bilanciamento)
                 # In Storico usiamo dose originaria + qta originaria + botti originali (pre-bilanciamento)
-                is_revisionati = (self.tipo_vista == "AUTORIZZATI")
 
                 query = text(f"""
                     SELECT
@@ -1206,12 +1291,23 @@ class SchedaOperazioni(QWidget):
                 ]
                 df = df[colonne_ordinate]
 
+                # Avviso opzionale sui trattamenti esclusi per blacklist
+                # (vedi pre-check a inizio metodo). Mostrato solo se almeno
+                # uno è stato escluso e qualcuno è comunque finito nell'export.
+                nota_bl = ""
+                if blacklist_esclusi:
+                    nomi_bl = ", ".join(sorted({n for _, n in blacklist_esclusi if n}))
+                    nota_bl = (
+                        f"\n\n{len(blacklist_esclusi)} trattamenti esclusi "
+                        f"perché il prodotto è in blacklist: {nomi_bl}."
+                    )
+
                 # Dispatch in base al formato scelto dall'utente.
                 if is_pdf:
                     self._scrivi_pdf(df, f_p, suffisso)
                     QMessageBox.information(
                         self, "Esportazione",
-                        f"File PDF salvato correttamente:\n{f_p}",
+                        f"File PDF salvato correttamente:\n{f_p}{nota_bl}",
                     )
                     return
 
@@ -1241,7 +1337,7 @@ class SchedaOperazioni(QWidget):
                     ws.row_dimensions[1].height = 30
                     ws.freeze_panes = "A2"
 
-            QMessageBox.information(self, "Esportazione", f"File Excel salvato correttamente:\n{f_p}")
+            QMessageBox.information(self, "Esportazione", f"File Excel salvato correttamente:\n{f_p}{nota_bl}")
         except ImportError as e:
             # Messaggio specifico in base alla libreria mancante.
             missing = "reportlab" if "reportlab" in str(e) else "pandas/openpyxl"

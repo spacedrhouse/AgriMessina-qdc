@@ -527,7 +527,14 @@ class DialogCompensaDisavanzo(QDialog):
                 if payload_src:
                     enqueue_operation(self.engine, "TRATTAMENTO", "UPDATE", entity_id=src_tratt_id, payload=payload_src)
 
-            payload_dest = _build_trattamento_payload(self.engine, tratt_id_dest)
+            # Sul figlio appena creato includiamo is_autorizzato nel payload:
+            # nasce =1 (vedi INSERT a riga 501) e il server deve persistere
+            # questo stato, altrimenti al reconcile torna a 0 e il figlio
+            # finisce visivamente "in Storico" (vedi bug ri-bilanciamento).
+            payload_dest = _build_trattamento_payload(
+                self.engine, tratt_id_dest,
+                include_is_autorizzato=tratt_dest_was_new,
+            )
             if payload_dest:
                 op = "INSERT" if tratt_dest_was_new else "UPDATE"
                 enqueue_operation(self.engine, "TRATTAMENTO", op, entity_id=tratt_id_dest, payload=payload_dest)
@@ -1703,14 +1710,28 @@ class DialogStoricoProdottiTendone(QDialog):
 
             # Blocco: i bilanciamenti modificano solo il magazzino fittizio,
             # che è alimentato dai trattamenti Revisionati. Se per questo
-            # prodotto su questo tendone non c'è alcun trattamento autorizzato,
+            # prodotto su questo tendone non c'è alcun trattamento Revisionato,
             # bilanciare non avrebbe effetto sul magazzino. Vietiamo a monte.
+            # NOTA: oltre a is_autorizzato=1, accettiamo anche i trattamenti
+            # "solo-bilanciamento" (tutti i dt is_bilanciamento=1). Sono i
+            # figli generati da DialogCompensaDisavanzo: vivono nella vista
+            # Revisionati (vedi filtro_autorizzato in ui_trattamenti.py:845)
+            # e logicamente sono parte della catena revisionata, anche se
+            # talvolta arrivano dal server con is_autorizzato=0 (vedi bug
+            # del payload INSERT prima di Fix 1).
             n_revisionati = conn.execute(text("""
                 SELECT COUNT(DISTINCT tr.id)
                 FROM dettaglio_trattamenti dt
                 JOIN trattamenti tr ON tr.id = dt.trattamento_id
                 WHERE tr.prodotto_id = :pid AND dt.tendone_id = :tid
-                  AND tr.is_autorizzato = 1
+                  AND (
+                    tr.is_autorizzato = 1
+                    OR (
+                      SELECT MIN(COALESCE(dt2.is_bilanciamento, 0))
+                      FROM dettaglio_trattamenti dt2
+                      WHERE dt2.trattamento_id = tr.id
+                    ) = 1
+                  )
             """), {"pid": limiti[0], "tid": self.tendone_id}).scalar() or 0
             if n_revisionati == 0:
                 QMessageBox.warning(
