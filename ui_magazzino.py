@@ -611,19 +611,15 @@ class DialogRegistroProdotto(QDialog):
 class PannelloProdotti(PannelloBaseDialog):
     COLONNE_NASCOSTE = [0]
 
-    def __init__(self, engine, db, azienda_filter: str, api):
+    def __init__(self, engine, db, azienda_filter: str):
         """
         Args:
             azienda_filter: nome dell'azienda magazzino (es. "Agrimessina").
                 Il pannello mostra solo i movimenti/giacenze di quell'azienda
                 + degli alias che mappano su di essa (vedi WAREHOUSE_ALIASES).
-            api: ApiClient: serve per il pulsante "Ricalcola scarichi" che
-                triggera il rebuild server-side via POST /magazzino/ricalcola
-                seguito da un reconcile.
         """
         super().__init__()
         self.engine, self.db = engine, db
-        self.api = api
         self.azienda_filter = azienda_filter
         self.azienda_ids = self._resolve_filter_ids()  # lista per IN clause SQL
 
@@ -636,11 +632,6 @@ class PannelloProdotti(PannelloBaseDialog):
         self.btn_export_tutti_mov.setProperty('class', 'success')
         self.btn_export_tutti_mov.clicked.connect(self._esporta_tutti_movimenti)
 
-        # Rebuild locale degli scarichi automatici in entrambi i registri.
-        self.btn_ricalcola = QPushButton("🔧 Ricalcola scarichi")
-        self.btn_ricalcola.setProperty('class', 'warning')
-        self.btn_ricalcola.clicked.connect(self._ricalcola_scarichi)
-
         # Toggle reale ↔ fittizio. Classe `secondary` (blu): nel QSS globale
         # esistono solo success/warning/danger/secondary; "primary" non c'è e
         # ricadeva nel default Qt fuori standard.
@@ -650,8 +641,7 @@ class PannelloProdotti(PannelloBaseDialog):
 
         top_layout = self.layout().itemAt(0).layout()
         top_layout.insertWidget(4, self.btn_export_tutti_mov)
-        top_layout.insertWidget(5, self.btn_ricalcola)
-        top_layout.insertWidget(6, self.btn_toggle_fittizio)
+        top_layout.insertWidget(5, self.btn_toggle_fittizio)
 
         self.vista.doubleClicked.connect(self._on_doppio_click)
         self.aggiorna_dati()
@@ -724,36 +714,6 @@ class PannelloProdotti(PannelloBaseDialog):
         self.esegui_query(query, self.engine)
         self._nascondi_colonne()
         self.vista.resizeColumnsToContents()
-
-    def _ricalcola_scarichi(self):
-        """Rebuild manuale degli scarichi automatici in ENTRAMBI i registri.
-
-        Cancella tutte le righe con trattamento_id e ricostruisce dai
-        trattamenti correnti: il reale dai dt non-bilanciamento (qta originale),
-        il fittizio dai dt completi (qta corrente). I CARICHI/SCARICHI manuali
-        non vengono toccati.
-        """
-        if QMessageBox.question(
-            self, "Ricalcola scarichi",
-            "Vuoi davvero ricalcolare TUTTI gli scarichi automatici dei due registri?\n\n"
-            "Le righe con trattamento_id verranno cancellate e ricostruite a "
-            "partire dai trattamenti correnti.\n\n"
-            "I CARICHI manuali NON verranno toccati.",
-            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
-            QMessageBox.StandardButton.No,
-        ) != QMessageBox.StandardButton.Yes:
-            return
-        try:
-            from magazzino_logic import ricalcola_tutti
-            esito = ricalcola_tutti(self.engine)
-            self.aggiorna_dati()
-            QMessageBox.information(
-                self, "Ricalcolo completato",
-                f"Ricalcolati {esito['reale']} trattamenti nel reale, "
-                f"{esito['fittizio']} nel fittizio.",
-            )
-        except Exception as e:
-            QMessageBox.critical(self, "Errore", f"Ricalcolo fallito:\n{e}")
 
     def _esporta_tutti_movimenti(self):
         # Nome file di default include il magazzino, se filtrato
