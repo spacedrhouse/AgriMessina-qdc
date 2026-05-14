@@ -487,12 +487,12 @@ class DialogRegistroProdotto(QDialog):
         btn_nuovo.clicked.connect(self._nuovo_movimento)
         btn_modifica.clicked.connect(self._modifica_movimento)
         btn_elimina.clicked.connect(self._elimina_movimento)
-        # Read-only in vista fittizio
+        # Read-only in vista fittizio: i bottoni di scrittura manuale sono
+        # nascosti del tutto (il fittizio si popola solo dai trattamenti
+        # revisionati, quindi non c'è nulla da fare a mano).
         if self.mostra_fittizio:
             for b in (btn_nuovo, btn_modifica, btn_elimina):
-                b.setEnabled(False)
-                b.setToolTip("Il magazzino fittizio è in sola lettura: "
-                             "si popola solo automaticamente dai trattamenti revisionati.")
+                b.setVisible(False)
         h_tool.addWidget(btn_nuovo); h_tool.addWidget(btn_modifica); h_tool.addWidget(btn_elimina); h_tool.addStretch()
         layout.addLayout(h_tool)
 
