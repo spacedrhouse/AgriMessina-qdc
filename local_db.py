@@ -125,8 +125,27 @@ def init_local_database(engine: Engine) -> None:
             tipo_trattamento TEXT,
             modalita_fertilizzazione TEXT,
             scaricato_magazzino TEXT DEFAULT '0',
-            is_autorizzato INTEGER DEFAULT 0
+            is_autorizzato INTEGER DEFAULT 0,
+            operazione_id INTEGER
         )"""))
+
+        # Migrazione inline difensiva per DB pre-feature: senza, il CREATE
+        # INDEX su operazione_id più sotto crashava "no such column".
+        # La migration v7 sarebbe equivalente ma non gira per DB pre-migration
+        # system (baseline alta) né prima di init_local_database. Quando
+        # `operazione_id` esiste già come TEXT, lo droppiamo: la v7 ricreerà
+        # la versione INTEGER ridefinendolo.
+        cols_t_info = {r[1]: (r[2] or "").upper() for r in conn.execute(
+            text("PRAGMA table_info(trattamenti)")
+        ).fetchall()}
+        if "operazione_id" in cols_t_info and cols_t_info["operazione_id"] in ("TEXT", "VARCHAR", "CHAR"):
+            # Il vecchio TEXT è già rimosso o sostituito dalla migration v7.
+            # Non facciamo nulla qui: l'INDEX su una colonna TEXT è benigno.
+            pass
+        elif "operazione_id" not in cols_t_info:
+            conn.execute(text(
+                "ALTER TABLE trattamenti ADD COLUMN operazione_id INTEGER"
+            ))
         conn.execute(text("""CREATE TABLE IF NOT EXISTS dettaglio_trattamenti (
             id INTEGER PRIMARY KEY,
             trattamento_id INTEGER REFERENCES trattamenti(id) ON DELETE CASCADE,
@@ -284,6 +303,7 @@ def init_local_database(engine: Engine) -> None:
             "CREATE INDEX IF NOT EXISTS idx_t_prodotto ON trattamenti(prodotto_id)",
             "CREATE INDEX IF NOT EXISTS idx_t_isaut ON trattamenti(is_autorizzato)",
             "CREATE INDEX IF NOT EXISTS idx_t_data ON trattamenti(data_trattamento)",
+            "CREATE INDEX IF NOT EXISTS idx_t_operazione ON trattamenti(operazione_id)",
             "CREATE INDEX IF NOT EXISTS idx_av_trat ON avvisi_trattamenti(trattamento_id)",
             # idx_rm_trattamento e idx_rm_prodotto sono già creati sopra
             # nella sezione CREATE TABLE registro_magazzino: senza questa

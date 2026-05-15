@@ -353,6 +353,31 @@ class ApiClient:
     def revoca_trattamento(self, id: int) -> Any:
         return self._request("POST", f"/trattamenti/{id}/revoca")
 
+    # ---- OPERAZIONI (bundle multi-prodotto atomico) ------------------------
+
+    def create_operazione(self, dto: Dict[str, Any]) -> Dict[str, Any]:
+        """POST /operazioni — crea atomicamente N trattamenti che condividono
+        lo stesso `operazione_id` (allocato dal server). Risposta:
+        `OperazioneOut` con `operazione_id` int e `trattamenti[]` (ognuno
+        con id server-side e operazione_id allocato)."""
+        return self._request("POST", "/operazioni", json_body=dto)
+
+    def delete_operazione(self, operazione_id: int) -> Any:
+        """DELETE /operazioni/{operazione_id} — cancella tutti i trattamenti
+        dell'operazione in una sola transazione server-side."""
+        return self._request("DELETE", f"/operazioni/{operazione_id}")
+
+    # ---- UTENTI ------------------------------------------------------------
+
+    def get_utenti(self) -> list[dict]:
+        """GET /utenti — lista utenti per popolare la dropdown 'Operatore'.
+
+        Risposta: lista di `UtenteOut` con `display_name` computato server-side
+        (Nome Cognome, con disambiguazione data_nascita per omonimi).
+        """
+        resp = self._request("GET", "/utenti")
+        return resp if isinstance(resp, list) else []
+
     # ---- MAGAZZINO ----------------------------------------------------------
 
     def sync_movimenti(self, since: Optional[str] = None,

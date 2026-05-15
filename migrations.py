@@ -135,9 +135,104 @@ def _migrate_v4(conn) -> None:
         log.info("[migration v4] aggiunta colonna bilanciamento_group_id")
 
 
+def _migrate_v5(conn) -> None:
+    """Aggiunge `operazione_id` su trattamenti.
+
+    Identifica l'operazione "in campo" da cui sono stati generati N
+    trattamenti separati. L'app Android consente di inserire più prodotti
+    in una singola operazione (versati insieme in botte): il backend
+    splitta in N record (uno per prodotto), ma tutti condividono lo stesso
+    `operazione_id` (UUID/stringa opaca generato client-side al momento
+    dell'inserimento). Permette di ricostruire l'unità logica originale
+    per reportistica, viste raggruppate e operazioni di bilanciamento
+    coerenti.
+
+    Tipo TEXT (non INTEGER) per consentire la generazione offline lato
+    Android senza round-trip al server. NULL = trattamento creato senza
+    grouping (desktop, sub-bilanciamenti, record storici pre-feature).
+    """
+    cols = {row[1] for row in conn.execute(
+        text("PRAGMA table_info(trattamenti)")
+    ).fetchall()}
+    if "operazione_id" not in cols:
+        conn.execute(text(
+            "ALTER TABLE trattamenti ADD COLUMN operazione_id TEXT"
+        ))
+        conn.execute(text(
+            "CREATE INDEX IF NOT EXISTS idx_t_operazione "
+            "ON trattamenti(operazione_id)"
+        ))
+        log.info("[migration v5] aggiunta colonna operazione_id + indice")
+
+
+def _migrate_v6(conn) -> None:
+    """Aggiunge `operazione_numero` su trattamenti.
+
+    NB: questa colonna viene rinominata in `operazione_id` (INT) nella v7
+    consolidante. v6 resta per compatibilità con DB intermedi.
+    """
+    cols = {row[1] for row in conn.execute(
+        text("PRAGMA table_info(trattamenti)")
+    ).fetchall()}
+    if "operazione_numero" not in cols and "operazione_id" not in cols:
+        conn.execute(text(
+            "ALTER TABLE trattamenti ADD COLUMN operazione_numero INTEGER"
+        ))
+        log.info("[migration v6] aggiunta colonna operazione_numero")
+
+
+def _migrate_v7(conn) -> None:
+    """Consolida operazione_id (TEXT/UUID) + operazione_numero (INTEGER) in
+    un'unica colonna `operazione_id` di tipo INTEGER.
+
+    Procedimento SQLite:
+      1. Se esiste ancora operazione_id TEXT → DROP COLUMN (SQLite 3.35+).
+      2. Se operazione_numero esiste → RENAME COLUMN a operazione_id.
+      3. Ricrea idx_t_operazione su operazione_id.
+
+    Il backfill (assegnare un operazione_id a tutti i NULL) NON viene fatto
+    qui: il desktop riceve i dati via sync dal server, che fa il proprio
+    backfill server-side al primo restart post-migration.
+    """
+    cols = {row[1]: (row[2] or "").upper() for row in conn.execute(
+        text("PRAGMA table_info(trattamenti)")
+    ).fetchall()}
+
+    # Step 1: drop operazione_id TEXT se ancora presente.
+    if "operazione_id" in cols and cols["operazione_id"] in ("TEXT", "VARCHAR", "CHAR"):
+        try:
+            conn.execute(text("DROP INDEX IF EXISTS idx_t_operazione"))
+            conn.execute(text("ALTER TABLE trattamenti DROP COLUMN operazione_id"))
+            log.info("[migration v7] drop colonna operazione_id (TEXT/UUID)")
+        except Exception as e:
+            log.warning("[migration v7] drop operazione_id fallito: %s", e)
+
+    # Re-read cols dopo drop.
+    cols = {row[1] for row in conn.execute(
+        text("PRAGMA table_info(trattamenti)")
+    ).fetchall()}
+
+    # Step 2: rinomina operazione_numero → operazione_id.
+    if "operazione_numero" in cols and "operazione_id" not in cols:
+        conn.execute(text("DROP INDEX IF EXISTS idx_t_op_numero"))
+        conn.execute(text(
+            "ALTER TABLE trattamenti RENAME COLUMN operazione_numero TO operazione_id"
+        ))
+        log.info("[migration v7] rename operazione_numero → operazione_id (INTEGER)")
+
+    # Step 3: idx unico.
+    conn.execute(text("DROP INDEX IF EXISTS idx_t_operazione"))
+    conn.execute(text(
+        "CREATE INDEX IF NOT EXISTS idx_t_operazione ON trattamenti(operazione_id)"
+    ))
+
+
 MIGRATIONS: list[tuple[int, Callable]] = [
     (3, _migrate_v3),
     (4, _migrate_v4),
+    (5, _migrate_v5),
+    (6, _migrate_v6),
+    (7, _migrate_v7),
 ]
 
 

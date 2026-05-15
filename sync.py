@@ -169,10 +169,10 @@ def _upsert_trattamenti(engine: Engine, items: list) -> None:
                     conn.execute(text("""
                         INSERT INTO trattamenti (id, data_trattamento, data_inserimento, prodotto_id,
                             operatore, tipo_trattamento, modalita_fertilizzazione,
-                            scaricato_magazzino, is_autorizzato)
+                            scaricato_magazzino, is_autorizzato, operazione_id)
                         VALUES (:id, :data_trattamento, :data_inserimento, :prodotto_id,
                             :operatore, :tipo_trattamento, :modalita_fertilizzazione,
-                            :scaricato_magazzino, :is_autorizzato)
+                            :scaricato_magazzino, :is_autorizzato, :operazione_id)
                         ON CONFLICT(id) DO UPDATE SET
                             data_trattamento=excluded.data_trattamento,
                             data_inserimento=excluded.data_inserimento,
@@ -181,7 +181,8 @@ def _upsert_trattamenti(engine: Engine, items: list) -> None:
                             tipo_trattamento=excluded.tipo_trattamento,
                             modalita_fertilizzazione=excluded.modalita_fertilizzazione,
                             scaricato_magazzino=excluded.scaricato_magazzino,
-                            is_autorizzato=excluded.is_autorizzato
+                            is_autorizzato=excluded.is_autorizzato,
+                            operazione_id=excluded.operazione_id
                     """), {
                         "id": tid,
                         "data_trattamento": t.get("data_trattamento"),
@@ -192,6 +193,7 @@ def _upsert_trattamenti(engine: Engine, items: list) -> None:
                         "modalita_fertilizzazione": t.get("modalita_fertilizzazione"),
                         "scaricato_magazzino": t.get("scaricato_magazzino", "0"),
                         "is_autorizzato": t.get("is_autorizzato", 0),
+                        "operazione_id": t.get("operazione_id"),
                     })
                     # Dettagli: ricreati ad ogni upsert (sostituzione completa).
                     # registro_magazzino NON ha FK verso dettaglio_trattamenti,

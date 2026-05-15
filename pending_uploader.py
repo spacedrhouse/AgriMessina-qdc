@@ -149,6 +149,17 @@ def _call_api(api: ApiClient, engine: Engine, op: dict, payload: dict):
         if ot == "INSERT": return api.create_movimento(payload)
         if ot == "UPDATE": api.update_movimento(eid, payload); return None
         if ot == "DELETE": api.delete_movimento(eid); return None
+    elif et == "OPERAZIONE":
+        # Multi-prodotto atomico: il payload qui è un wrapper
+        # {"operazione": OperazioneIn, "local_ids": [...]}; mandiamo al server
+        # solo `operazione`, mentre `local_ids` serve allo swap post-success.
+        if ot == "INSERT":
+            return api.create_operazione(payload.get("operazione") or {})
+        if ot == "DELETE":
+            op_id = payload.get("operazione_id")
+            if op_id is not None:
+                api.delete_operazione(int(op_id))
+            return None
 
     return None
 
@@ -195,6 +206,39 @@ def _park_conflict(conn, et: str, table: str, conflict_id, pending: List[dict]) 
     log.warning("Evitata collisione: record locale spostato in parcheggio (%s → %s)", conflict_id, temp_id)
 
 
+def _apply_swap_inner(conn, et: str, table: str, old_id, new_id,
+                      pending: List[dict]) -> None:
+    """Inner swap logic. Il chiamante deve aver già:
+      - aperto una transazione
+      - settato PRAGMA defer_foreign_keys
+      - settato _sync_flags.downloading=1
+    NON cancella la pending op (responsabilità del chiamante)."""
+    conflict = conn.execute(text(f"SELECT id FROM {table} WHERE id = :new"), {"new": new_id}).scalar()
+    if conflict is not None:
+        _park_conflict(conn, et, table, conflict, pending)
+
+    # Aggiorna ID testata (slot ora libero) e FK figlie
+    conn.execute(text(f"UPDATE {table} SET id = :new WHERE id = :old"), {"new": new_id, "old": old_id})
+    _rebind_child_fks(conn, et, old_id, new_id)
+
+    if et == "TRATTAMENTO":
+        # Coerenza visiva delle note di scarico automatico
+        conn.execute(text("UPDATE registro_magazzino SET note = 'Scarico automatico T#' || :new WHERE note = 'Scarico automatico T#' || :old"),
+                     {"new": new_id, "old": old_id})
+
+    # Rimappa le pending op successive che riferivano il vecchio ID
+    conn.execute(text(
+        "UPDATE pending_operations SET entity_id = :new "
+        "WHERE entity_type = :et AND entity_id = :old"
+    ), {"new": new_id, "et": et, "old": old_id})
+
+    for future_op in pending:
+        if future_op["entity_type"] == et and str(future_op["entity_id"]) == str(old_id):
+            future_op["entity_id"] = new_id
+
+    log.info("ID swap %s: %s → %s", et, old_id, new_id)
+
+
 def _apply_id_swap(engine: Engine, et: str, table: str, old_id, new_id,
                    op_id: int, pending: List[dict]) -> None:
     """Esegue lo swap completo dell'ID locale → ID server e cancella la pending
@@ -208,33 +252,49 @@ def _apply_id_swap(engine: Engine, et: str, table: str, old_id, new_id,
         conn.execute(text("PRAGMA foreign_keys = ON"))
         conn.execute(text("UPDATE _sync_flags SET value = 1 WHERE key = 'downloading'"))
 
-        conflict = conn.execute(text(f"SELECT id FROM {table} WHERE id = :new"), {"new": new_id}).scalar()
-        if conflict is not None:
-            _park_conflict(conn, et, table, conflict, pending)
-
-        # Aggiorna ID testata (slot ora libero) e FK figlie
-        conn.execute(text(f"UPDATE {table} SET id = :new WHERE id = :old"), {"new": new_id, "old": old_id})
-        _rebind_child_fks(conn, et, old_id, new_id)
-
-        if et == "TRATTAMENTO":
-            # Coerenza visiva delle note di scarico automatico
-            conn.execute(text("UPDATE registro_magazzino SET note = 'Scarico automatico T#' || :new WHERE note = 'Scarico automatico T#' || :old"),
-                         {"new": new_id, "old": old_id})
-
-        # Rimappa le pending op successive che riferivano il vecchio ID
-        conn.execute(text(
-            "UPDATE pending_operations SET entity_id = :new "
-            "WHERE entity_type = :et AND entity_id = :old"
-        ), {"new": new_id, "et": et, "old": old_id})
+        _apply_swap_inner(conn, et, table, old_id, new_id, pending)
 
         conn.execute(text("UPDATE _sync_flags SET value = 0 WHERE key = 'downloading'"))
-        log.info("ID swap %s: %s → %s", et, old_id, new_id)
-
-        for future_op in pending:
-            if future_op["entity_type"] == et and str(future_op["entity_id"]) == str(old_id):
-                future_op["entity_id"] = new_id
-
         # DELETE atomico della pending op nella stessa transazione dello swap
+        conn.execute(text("DELETE FROM pending_operations WHERE id = :pid"), {"pid": op_id})
+
+
+def _apply_operazione_swap(engine: Engine, local_ids: list, server_trattamenti: list,
+                           op_id: int, pending: List[dict]) -> None:
+    """Multi-swap atomico per OPERAZIONE INSERT.
+
+    Il server restituisce `trattamenti[]` (in ordine = local_ids[i]). Per ogni
+    coppia (local_id, server.id) eseguiamo lo swap dei trattamenti col loro
+    cascade FK; poi popoliamo `operazione_numero`/`operazione_id` sui record
+    (ora identificati dai server ID). Tutto in UNA transazione, così un crash
+    a metà non lascia trattamenti mezzo-swappati.
+    """
+    with engine.begin() as conn:
+        conn.execute(text("PRAGMA defer_foreign_keys = TRUE"))
+        conn.execute(text("PRAGMA foreign_keys = ON"))
+        conn.execute(text("UPDATE _sync_flags SET value = 1 WHERE key = 'downloading'"))
+
+        for local_id, st in zip(local_ids, server_trattamenti):
+            sid = st.get("id")
+            if sid is None or str(sid) == str(local_id):
+                continue
+            _apply_swap_inner(conn, "TRATTAMENTO", "trattamenti", local_id, sid, pending)
+
+        # Aggiorna operazione_id su tutti i trattamenti del bundle (dopo
+        # swap, gli ID locali nella tabella corrispondono ora a quelli del
+        # server). Il server ha allocato un operazione_id condiviso.
+        for st in server_trattamenti:
+            sid = st.get("id")
+            if sid is None:
+                continue
+            conn.execute(text(
+                "UPDATE trattamenti SET operazione_id = :u WHERE id = :id"
+            ), {
+                "u": st.get("operazione_id"),
+                "id": sid,
+            })
+
+        conn.execute(text("UPDATE _sync_flags SET value = 0 WHERE key = 'downloading'"))
         conn.execute(text("DELETE FROM pending_operations WHERE id = :pid"), {"pid": op_id})
 
 
@@ -308,19 +368,41 @@ def upload_pending(api: ApiClient, engine: Engine, notifier=None) -> tuple[int, 
             # nuovo id assegnato dal backend, per UPDATE/DELETE/AUTORIZZA/REVOCA
             # è l'eid che avevamo già (record sincronizzato in precedenza).
             server_id = eid
+            server_ids_per_eco: list = []  # per OPERAZIONE: N trattamenti
             if ot == "INSERT":
                 had_insert = True
-                new_id = _extract_new_id(resp)
-                table = ENTITY_TO_TABLE.get(et)
-                if new_id is not None and table:
-                    server_id = new_id
-                    if str(new_id) != str(eid):
-                        _apply_id_swap(engine, et, table, eid, new_id, op["id"], pending)
-                        pending_op_deleted = True
-                    else:
-                        log.debug("ID coincidente %s: %s (nessuno swap necessario)", et, eid)
-                elif new_id is None:
-                    log.error("ID swap fallito: il server ha salvato ma non sono riuscito ad estrarre l'ID. resp=%r", resp)
+                if et == "OPERAZIONE":
+                    # Bundle multi-prodotto: la response ha `trattamenti[]`
+                    # con N ID server. local_ids del payload (parallelo) ci
+                    # dice quale local va swappato in quale server.
+                    op_resp = resp if isinstance(resp, dict) else {}
+                    local_ids = payload.get("local_ids", []) or []
+                    server_trattamenti = op_resp.get("trattamenti", []) or []
+                    if len(local_ids) != len(server_trattamenti):
+                        log.error(
+                            "OPERAZIONE INSERT swap: len locali %d != len server %d",
+                            len(local_ids), len(server_trattamenti),
+                        )
+                    _apply_operazione_swap(engine, local_ids, server_trattamenti,
+                                           op["id"], pending)
+                    pending_op_deleted = True
+                    # Per la soppressione eco SSE: prendiamo gli ID dei
+                    # trattamenti creati (ognuno emette il suo evento).
+                    server_ids_per_eco = [
+                        st.get("id") for st in server_trattamenti if st.get("id") is not None
+                    ]
+                else:
+                    new_id = _extract_new_id(resp)
+                    table = ENTITY_TO_TABLE.get(et)
+                    if new_id is not None and table:
+                        server_id = new_id
+                        if str(new_id) != str(eid):
+                            _apply_id_swap(engine, et, table, eid, new_id, op["id"], pending)
+                            pending_op_deleted = True
+                        else:
+                            log.debug("ID coincidente %s: %s (nessuno swap necessario)", et, eid)
+                    elif new_id is None:
+                        log.error("ID swap fallito: il server ha salvato ma non sono riuscito ad estrarre l'ID. resp=%r", resp)
 
             if not pending_op_deleted:
                 _delete_op(engine, op["id"])
@@ -331,7 +413,12 @@ def upload_pending(api: ApiClient, engine: Engine, notifier=None) -> tuple[int, 
             # "Trattamento #X aggiunto/eliminato da un altro client" anche
             # quando il modificatore sei tu.
             if notifier is not None and hasattr(notifier, "mark_recent_local"):
-                notifier.mark_recent_local(et, server_id)
+                if et == "OPERAZIONE" and server_ids_per_eco:
+                    # Ogni trattamento dell'operazione genera un evento SSE.
+                    for sid in server_ids_per_eco:
+                        notifier.mark_recent_local("TRATTAMENTO", sid)
+                else:
+                    notifier.mark_recent_local(et, server_id)
 
         except NotAuthenticatedError:
             # 401/403: token JWT scaduto/revocato. Non incrementiamo retry_count:

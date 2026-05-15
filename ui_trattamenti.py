@@ -210,10 +210,13 @@ class WidgetSottoCardBilanciamento(QFrame):
             super().mousePressEvent(event)
 
 class WidgetTrattamentoCard(QFrame):
-    def __init__(self, riga_dati, on_modifica, on_elimina, on_click, on_toggle_select, on_revisiona=None, parent=None):
+    def __init__(self, riga_dati, on_modifica, on_elimina, on_click, on_toggle_select,
+                 on_revisiona=None, on_operazione_click=None, parent=None):
         super().__init__(parent)
         self.id_trattamento = riga_dati["_ID_T"]
         self.callback_click = on_click
+        self._on_operazione_click = on_operazione_click
+        self._operazione_id = None
         self.setObjectName("TrattamentoCard")
         self.setCursor(Qt.CursorShape.PointingHandCursor)
 
@@ -288,6 +291,35 @@ class WidgetTrattamentoCard(QFrame):
             f"margin-left: 8px;"
         )
         riga1.addWidget(lbl_id)
+
+        # Badge "Operazione N": id univoco dell'operazione in campo, allocato
+        # dal server (vedi _alloca_operazione_id in trattamenti_router.py).
+        # Tutti i trattamenti dello stesso gruppo condividono lo stesso
+        # operazione_id; ogni singolo ha il suo. Click sul badge → popup
+        # con la lista dei trattamenti collegati.
+        op_n = int(riga_dati.get("OperazioneN") or 0)
+        op_id = riga_dati.get("OperazioneId")
+        if op_id is not None:
+            self._operazione_id = int(op_id)
+            lbl_op = QLabel(f"Operazione {int(op_id)}")
+            tooltip_lines = [f"Operazione id_operazione = {int(op_id)}"]
+            if op_n > 1:
+                tooltip_lines.append(
+                    f"{op_n} trattamenti collegati. Clicca per vedere la lista."
+                )
+            else:
+                tooltip_lines.append(
+                    "Nessun altro trattamento collegato (solo questo)."
+                )
+            lbl_op.setToolTip("\n".join(tooltip_lines))
+            lbl_op.setStyleSheet(
+                f"color: white; font-size: 11px; font-weight: bold; "
+                f"background: #6A1B9A; padding: 1px 8px; border-radius: 8px; "
+                f"margin-left: 6px;"
+            )
+            lbl_op.setCursor(Qt.CursorShape.PointingHandCursor)
+            lbl_op.mousePressEvent = lambda _e: self._mostra_operazione_collegati()
+            riga1.addWidget(lbl_op)
 
         riga1.addStretch() # Spinge la data tutta a destra
 
@@ -397,6 +429,11 @@ class WidgetTrattamentoCard(QFrame):
             self.callback_click(self.id_trattamento)
         else:
             super().mousePressEvent(event)
+
+    def _mostra_operazione_collegati(self):
+        if self._on_operazione_click and self._operazione_id:
+            self._on_operazione_click(self._operazione_id)
+
 
 class SchedaOperazioni(QWidget):
     # Finestra di "freschezza" dei dati post-reconcile: entro questi secondi
@@ -734,6 +771,57 @@ class SchedaOperazioni(QWidget):
         dialog = DialogDettaglioTrattamento(self.engine, trattamento_id, self.tipo_vista, self)
         dialog.exec()
 
+    def mostra_operazione_collegati(self, operazione_id):
+        """Popup con i trattamenti che condividono lo stesso `operazione_id`.
+
+        L'utente clicca il badge 🔗 sulla card per capire al volo quali altri
+        trattamenti facevano parte della stessa operazione in campo (più
+        prodotti versati nella stessa botte → registrati come N record
+        distinti dal backend, ma con lo stesso operazione_id generato
+        client-side al momento dell'inserimento).
+        """
+        with self.engine.connect() as conn:
+            righe = conn.execute(text("""
+                SELECT
+                    t.id,
+                    t.data_trattamento,
+                    p.nome_prodotto,
+                    t.operatore,
+                    (SELECT GROUP_CONCAT(DISTINCT ten.codice)
+                       FROM dettaglio_trattamenti dt
+                       JOIN tendoni ten ON ten.id = dt.tendone_id
+                      WHERE dt.trattamento_id = t.id
+                        AND (dt.is_bilanciamento = 0 OR dt.is_bilanciamento IS NULL)
+                    ) AS tendoni
+                FROM trattamenti t
+                JOIN prodotti p ON p.id = t.prodotto_id
+                WHERE t.operazione_id = :op
+                ORDER BY t.id
+            """), {"op": operazione_id}).fetchall()
+
+        if not righe:
+            QMessageBox.information(
+                self, "Operazione multi-prodotto",
+                "Nessun trattamento collegato trovato.",
+            )
+            return
+
+        lines = []
+        for r in righe:
+            ten = r[4] or "—"
+            op = r[3] or "—"
+            lines.append(f"• <b>T#{r[0]}</b> — {r[2]} ({r[1]}) — {ten} — 👤 {op}")
+        msg = QMessageBox(self)
+        msg.setIcon(QMessageBox.Icon.Information)
+        msg.setWindowTitle("Operazione multi-prodotto")
+        msg.setTextFormat(Qt.TextFormat.RichText)
+        msg.setText(
+            f"<b>{len(righe)} trattamenti</b> con id_operazione = "
+            f"<b>{int(operazione_id)}</b>:<br><br>"
+            + "<br>".join(lines)
+        )
+        msg.exec()
+
     def _notify_trattamento_changed(self):
         """Segnala che i trattamenti sono cambiati. I pannelli magazzino (e
         altri eventuali consumatori) vi si agganciano per refreshare le
@@ -840,6 +928,13 @@ class SchedaOperazioni(QWidget):
                 p.unita_misura AS "Unità Misura",
                 tg.solo_bilanciamenti AS "_SOLO_BIL",
                 t.is_autorizzato AS "IsAut",
+                t.operazione_id AS "OperazioneId",
+                -- Quanti trattamenti condividono la stessa operazione (incluso questo).
+                -- Quando operazione_id è NULL la condizione t_op.operazione_id = NULL
+                -- è sempre falsa → conta 0 → niente badge sulla card.
+                (SELECT COUNT(*) FROM trattamenti t_op
+                 WHERE t.operazione_id IS NOT NULL
+                   AND t_op.operazione_id = t.operazione_id) AS "OperazioneN",
                 (SELECT COUNT(*) FROM dettaglio_trattamenti WHERE trattamento_id = t.id AND is_bilanciamento = 1) AS "HasBil",
                 CASE tg.priorita_max
                     WHEN 5 THEN 5
@@ -896,10 +991,21 @@ class SchedaOperazioni(QWidget):
                             MIN(COALESCE(dt.is_bilanciamento, 0)) AS solo_bil,
                             MAX(p.min_sostanza) AS min_s, MAX(p.max_sostanza) AS max_s, MAX(p.blacklist) AS blacklist, MAX(p.unita_misura) AS unita_misura,
                             (
+                                -- Per /hl il volume d'acqua è SOMMA(botti) × 10 hl
+                                -- (botti reali del tendone), coerente con la dose
+                                -- effettiva del singolo trattamento. Fallback a
+                                -- ettari × 10 solo quando non risultano botti
+                                -- (record storici incompleti). Usare gli ettari
+                                -- quando esistono botti reali falsa il "Tot".
                                 SELECT ROUND(
                                     CASE
                                         WHEN LOWER(p2.unita_misura) LIKE '%/hl' THEN
-                                            SUM(dt2.quantita_sostanza) / (ten2.ettari * 10.0)
+                                            SUM(dt2.quantita_sostanza) / (
+                                                CASE WHEN COALESCE(SUM(CASE WHEN dt2.botti > 0 THEN dt2.botti ELSE 0 END), 0) > 0
+                                                     THEN SUM(CASE WHEN dt2.botti > 0 THEN dt2.botti ELSE 0 END) * 10.0
+                                                     ELSE ten2.ettari * 10.0
+                                                END
+                                            )
                                         ELSE
                                             SUM(dt2.quantita_sostanza) / ten2.ettari
                                     END, 4
@@ -992,6 +1098,7 @@ class SchedaOperazioni(QWidget):
                         self.mostra_dettagli,
                         self.gestisci_selezione,
                         self.revisiona_record,
+                        self.mostra_operazione_collegati,
                     )
                     if dati_card["_ID_T"] in self._selezionati:
                         card.check_select.setChecked(True)
@@ -1151,6 +1258,7 @@ class SchedaOperazioni(QWidget):
                         (a.botti_tot_finale * 1000) AS "Q.tà Acqua (litri)",
                         ROUND(a.qta_totale, 4) AS "Q.tà Totale Prodotto",
                         t.operatore AS "Operatore",
+                        t.operazione_id AS "_op_id_raw",
                         t.data_trattamento AS "_data_raw",
                         p.phi_giorni AS "_phi_raw"
                     FROM trattamenti t
@@ -1250,9 +1358,17 @@ class SchedaOperazioni(QWidget):
 
                 df['Primo giorno utile raccolta'] = df.apply(calc_giorno_utile, axis=1)
 
+                # Colonna "id_operazione": intero allocato dal server. Stesso
+                # valore che appare sul badge della card desktop. Trattamenti
+                # della stessa operazione hanno lo stesso valore. Vuota solo
+                # per record legacy senza operazione_id assegnato.
+                df['id_operazione'] = df['_op_id_raw'].apply(
+                    lambda n: int(n) if pd.notna(n) else ''
+                )
+
                 colonne_ordinate = [
                     "Azienda", "Agro", "Contrada", "Tendoni", "Ettari Totali",
-                    "Data", "Prodotto", "N. Registrazione", "Sostanza Attiva",
+                    "Data", "id_operazione", "Prodotto", "N. Registrazione", "Sostanza Attiva",
                     "Avversità", "PHI (giorni)", "Primo giorno utile raccolta",
                     "Unità Misura", "Dose", "N. Botti", "Q.tà Acqua (litri)",
                     "Q.tà Totale Prodotto", "Operatore"

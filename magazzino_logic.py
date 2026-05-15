@@ -25,7 +25,8 @@ CATENA DI SCARICO (warehouse fallback, prestiti tra aziende):
   Per ogni gruppo (prodotto, azienda del tendone), prova prima il magazzino
   primario dell'azienda; se saldo insufficiente passa ai fallback secondo
   config.WAREHOUSE_PRIORITY annotando "PRESTITO DA …". Se nemmeno la catena
-  basta, forza in negativo sul primario con nota "FORZATURA IN NEGATIVO".
+  basta, forza in negativo sul primario con la stessa nota dello scarico
+  ordinario ("Scarico automatico T#…").
 """
 from __future__ import annotations
 
@@ -172,10 +173,13 @@ def _ricalcola_scarico(conn, trattamento_id, table, includi_bilanciamenti):
             qta_rimanente -= prelievo
             giacenze[az_id] = saldo - prelievo
 
-        # 4. Forzatura in negativo se la catena non è bastata.
+        # 4. Forzatura in negativo se la catena non è bastata. La nota usa
+        # lo stesso testo del caso "giacenza disponibile" sul primario:
+        # all'utente non interessa distinguere il forzato in negativo,
+        # vede sempre uno scarico automatico associato al trattamento.
         if qta_rimanente > 0.0001:
-            primary_id, primary_nome = chain[0]
-            nota = f"Scarico T#{trattamento_id} FORZATURA IN NEGATIVO ({primary_nome})"
+            primary_id, _ = chain[0]
+            nota = f"Scarico automatico T#{trattamento_id}"
             conn.execute(text(f"""
                 INSERT INTO {table} (prodotto_id, trattamento_id, azienda_id,
                     azienda_id_origine, data_movimento, tipo_movimento, quantita, note)

@@ -219,8 +219,10 @@ class DialogCompensaDisavanzo(QDialog):
                 # botti=25 hl, non 22.7 hl).
                 botti_calc = net_botti if net_botti > 0 else _botti_stimate(t_ettari)
                 if '/hl' in self.um:
-                    max_consentito = self.max_s * botti_calc * 10.0
+                    volume_acqua = botti_calc * 10.0
+                    max_consentito = self.max_s * volume_acqua
                 else:
+                    volume_acqua = t_ettari
                     max_consentito = self.max_s * t_ettari
 
                 spazio = round(max_consentito - net_qty, 4)
@@ -233,21 +235,55 @@ class DialogCompensaDisavanzo(QDialog):
                 if x_max <= 0:
                     continue
 
+                # Dose finale stimata sul candidato ipotizzando di trasferire
+                # l'intero deficit. È il "what-if" che l'utente vuole valutare
+                # prima di scegliere: anche se il deficit eccede lo spazio
+                # reale, mostriamo la dose teorica così l'utente legge la
+                # gravità dello sforamento. "Sicuro" = la dose resta nella
+                # finestra [min_s, max_s].
+                dose_finale = (net_qty + self.deficit) / volume_acqua if volume_acqua > 0 else 0.0
+                causa_sovradose = self.max_s > 0 and dose_finale > self.max_s + 1e-6
+                causa_sottodose = self.min_s > 0 and dose_finale < self.min_s - 1e-6
+                sicuro = not (causa_sovradose or causa_sottodose)
+
+                # Errore = scostamento dalla finestra [min_s, max_s]. Serve
+                # per ordinare gli unsafe in modo che le violazioni minori
+                # appaiano per prime.
+                if causa_sovradose:
+                    errore = dose_finale - self.max_s
+                    alert_str = f"  ⚠️ sovradose: +{errore:.4g} {self.um} oltre max ({self.max_s:.4g})"
+                elif causa_sottodose:
+                    errore = self.min_s - dose_finale
+                    alert_str = f"  ⚠️ sottodose: -{errore:.4g} {self.um} sotto min ({self.min_s:.4g})"
+                else:
+                    errore = 0.0
+                    alert_str = ""
+
                 gia_trattato_vero = num_real > 0
-                testo = f"{'★ ' if gia_trattato_vero else ''}{t_cod} (Disp: {t_ettari:.4f} ha | Spazio: {spazio:.2f} {self.um.split('/')[0]})"
+                testo = (
+                    f"{'★ ' if gia_trattato_vero else ''}{t_cod} "
+                    f"(Disp: {t_ettari:.4f} ha | Spazio: {spazio:.2f} {self.um.split('/')[0]} "
+                    f"| Dose finale: {dose_finale:.4g} {self.um})"
+                    f"{alert_str}"
+                )
+
+                # Chiave di ordinamento:
+                # - safe (priorità 0): per dose finale DECRESCENTE → -dose
+                # - unsafe (priorità 1): per scostamento CRESCENTE → +errore
+                # Ordinando ascendentemente, i safe (0,…) vengono prima degli
+                # unsafe (1,…); dentro ogni gruppo l'ordine è quello richiesto.
+                sort_key = (0, -dose_finale) if sicuro else (1, errore)
 
                 candidati.append((
-                    gia_trattato_vero,
-                    t_ettari,
+                    sort_key,
                     testo,
                     {'id': t_id, 'x_max': x_max, 'x_min': 0.0001, 'ettari': t_ettari,
                      'spazio': spazio, 'tratt_id': l_id, 'operatore': l_op}
                 ))
 
-            # Stelle (già trattati) in cima, poi i più grandi
-            candidati.sort(key=lambda c: (c[0], c[1]), reverse=True)
+            candidati.sort(key=lambda c: c[0])
 
-            for _, _, testo, dati in candidati:
+            for _, testo, dati in candidati:
                 self.combo_target.addItem(testo, userData=dati)
 
         # 5. Gestione Stato UI
@@ -1056,13 +1092,16 @@ class DialogCompensaSottodose(QDialog):
             if self._target_is_sub_puro:
                 # Sub-bilanciamento puro: non è una proposta promossa a
                 # revisionato — è una testata creata ad-hoc per ricevere
-                # carico da altri trattamenti. L'annullamento cancella il
-                # sub e i dt negativi gemelli sui source: nessuna traccia.
+                # carico da altri trattamenti. L'annullamento cancella SOLO
+                # il sub (testata + suo dt positivo); i dt negativi sui source
+                # restano, così i source mantengono la loro qta post-bil. e
+                # la quantità del sub torna disponibile nel magazzino fittizio.
                 testo_strategia = (
                     "Strategia di ultima istanza: <b>annulla il bilanciamento</b>. "
                     "Il sub-trattamento viene rimosso e la quantità di "
-                    f"<b>{self.qta_tot_target:.4f} {um_simple}</b> torna ai "
-                    "trattamenti source. Nessuna traccia contabile sui source."
+                    f"<b>{self.qta_tot_target:.4f} {um_simple}</b> torna "
+                    "disponibile nel magazzino fittizio. I trattamenti source "
+                    "mantengono la loro quantità post-bilanciamento."
                 )
                 testo_btn = "↩️ Annulla Bilanciamento"
             else:
@@ -1257,10 +1296,12 @@ class DialogCompensaSottodose(QDialog):
         - **Sub-bilanciamento puro** (tutti i dt is_bilanciamento=1): il
           trattamento non è una proposta promossa, è una testata creata
           ad-hoc da `DialogCompensaDisavanzo`. Annullare significa
-          eliminare il sub E i dt negativi gemelli inseriti sui source —
-          il prodotto torna effettivamente disponibile sui source senza
-          lasciare traccia contabile. Il legame target↔dt-source è dato
-          dalla colonna `bilanciamento_group_id` (= id del sub).
+          eliminare il sub (testata + suo dt positivo); i dt negativi sui
+          source restano. Effetto: i trattamenti source mantengono la
+          loro qta post-bilanciamento (NON tornano in sovradose) e la
+          quantità del sub torna disponibile nel magazzino fittizio.
+          La `bilanciamento_group_id` sui dt orfani viene azzerata per
+          evitare riferimenti a una testata cancellata.
 
         - **Revisionato vero** (is_autorizzato=1 con almeno un dt
           is_bilanciamento=0): è una proposta promossa che vogliamo
@@ -1303,9 +1344,10 @@ class DialogCompensaSottodose(QDialog):
                 f"Confermi l'annullamento del sub-bilanciamento di "
                 f"<b>{self.nome_prodotto}</b> su questo tendone?<br><br>"
                 f"Il sub-trattamento verrà <b>rimosso</b> e la quantità di "
-                f"<b>{self.qta_tot_target:.4f} {um_simple}</b> tornerà ai "
-                f"trattamenti source. Nessuna traccia contabile verrà "
-                f"lasciata sui source.",
+                f"<b>{self.qta_tot_target:.4f} {um_simple}</b> tornerà "
+                f"disponibile nel <b>magazzino fittizio</b>. I trattamenti "
+                f"source mantengono la loro quantità attuale (non tornano "
+                f"in sovradose).",
                 QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
                 QMessageBox.StandardButton.No,
             )
@@ -1330,11 +1372,12 @@ class DialogCompensaSottodose(QDialog):
             if self._target_is_sub_puro:
                 with self.engine.begin() as conn:
                     # Recupera i trattamenti source legati a questo sub via
-                    # bilanciamento_group_id. Esclude il sub stesso. Se il
-                    # sub è legacy (pre-migration v4) group_id è NULL: in
-                    # quel caso source_ids resta vuoto e degradiamo a un
-                    # DELETE del solo sub (i dt negativi sui source restano
-                    # come traccia — informazione persa, non recuperabile).
+                    # bilanciamento_group_id. Esclude il sub stesso. Serve
+                    # per due cose:
+                    #   - azzerare il group_id sui dt negativi orfani
+                    #   - ricalcolare lo scarico fittizio dei source (i loro
+                    #     dt negativi sopravvivono → fittizio invariato, ma
+                    #     l'eliminazione del sub libera qta nel magazzino).
                     source_ids_toccati = [int(r[0]) for r in conn.execute(text("""
                         SELECT DISTINCT trattamento_id
                         FROM dettaglio_trattamenti
@@ -1342,11 +1385,22 @@ class DialogCompensaSottodose(QDialog):
                           AND trattamento_id != :gid
                     """), {"gid": target_tratt_id}).fetchall()]
 
-                    # Cancella tutti i dt del gruppo (positivo sul sub +
-                    # negativi sui source). Lo scarico fittizio del sub e
-                    # dei source toccati va ricalcolato dopo.
+                    # Cancella SOLO i dt del sub (il +qta sul tendone target).
+                    # I dt negativi sui source vengono lasciati: i source
+                    # mantengono la loro qta post-bilanciamento (non tornano
+                    # in sovradose) e la quantità del sub torna disponibile
+                    # nel magazzino fittizio.
                     conn.execute(text(
                         "DELETE FROM dettaglio_trattamenti "
+                        "WHERE trattamento_id = :tid"
+                    ), {"tid": target_tratt_id})
+
+                    # I dt negativi residui hanno bilanciamento_group_id che
+                    # punta a una testata che sta per essere cancellata.
+                    # Azzeriamolo per non lasciare riferimenti dangling.
+                    conn.execute(text(
+                        "UPDATE dettaglio_trattamenti "
+                        "SET bilanciamento_group_id = NULL "
                         "WHERE bilanciamento_group_id = :gid"
                     ), {"gid": target_tratt_id})
 
@@ -1361,14 +1415,17 @@ class DialogCompensaSottodose(QDialog):
                     cancella_scarico_fittizio(conn, target_tratt_id)
 
                     # DELETE della testata sub. ON DELETE CASCADE elimina
-                    # anche eventuali dt residui (non dovrebbero essercene).
+                    # eventuali dt residui (non dovrebbero essercene: la
+                    # DELETE qui sopra ha già rimosso quelli del sub).
                     conn.execute(text(
                         "DELETE FROM trattamenti WHERE id = :id"
                     ), {"id": target_tratt_id})
 
-                    # Ricalcola il fittizio per ogni source toccato: i dt
-                    # negativi sono spariti, quindi la quantità "tornata"
-                    # ai source si riflette nel loro magazzino fittizio.
+                    # Ricalcola il fittizio dei source: i loro dt negativi
+                    # restano, quindi lo scarico fittizio resta lo stesso
+                    # del post-bilanciamento. La chiamata è comunque utile
+                    # per coerenza (idempotente) e per gestire eventuali
+                    # piccoli drift contabili.
                     for sid in source_ids_toccati:
                         scarica_fittizio(conn, sid)
             else:
@@ -1409,22 +1466,12 @@ class DialogCompensaSottodose(QDialog):
             ricalcola_avvisi_globali(self.engine)
             self.accept()
             if self._target_is_sub_puro:
-                if source_ids_toccati:
-                    QMessageBox.information(
-                        self, "Bilanciamento annullato",
-                        "Il sub-trattamento è stato rimosso e la quantità è "
-                        "tornata ai trattamenti source. Nessuna traccia "
-                        "contabile è stata lasciata.",
-                    )
-                else:
-                    # Sub legacy senza group_id: rollback parziale.
-                    QMessageBox.warning(
-                        self, "Bilanciamento annullato (parziale)",
-                        "Il sub-trattamento è stato rimosso, ma i dt negativi "
-                        "sui trattamenti source non sono stati identificati "
-                        "(bilanciamento creato prima dell'introduzione del "
-                        "tracking). Restano come traccia contabile sui source.",
-                    )
+                QMessageBox.information(
+                    self, "Bilanciamento annullato",
+                    "Il sub-trattamento è stato rimosso. La quantità è tornata "
+                    "disponibile nel magazzino fittizio; i trattamenti source "
+                    "non sono stati modificati.",
+                )
             else:
                 QMessageBox.information(
                     self, "Revisione annullata",
@@ -2021,20 +2068,65 @@ class DialogAlertTrattamento(QDialog):
 
 
 class DialogNuovoTrattamento(QDialog):
+    """Dialog di inserimento trattamento, supporta uno o più prodotti.
+
+    - Singolo prodotto: usa il flusso classico `POST /trattamenti` (un solo
+      record creato sul server, niente operazione_id).
+    - Più prodotti: tutti condividono lo stesso operazione_id (UUID generato
+      al save) e vengono inviati al server come bundle atomico via
+      `POST /operazioni`. Il server alloca operazione_numero una volta sola.
+
+    UI: il combo + spinbox quantità + bottone "Aggiungi" servono a riempire
+    una lista di prodotti selezionati. Il `spin_botti` è globale (tutti
+    i prodotti condividono lo stesso volume d'acqua, come da convenzione
+    AgriMessina di mescolare più sostanze nella stessa botte).
+    """
+
     def __init__(self, engine, parent=None):
         super().__init__(parent)
         self.engine, self._selezione = engine, {}
+        # Lista dei prodotti selezionati. Ogni voce:
+        #   {"id": prodotto_id, "nome": str, "um": str, "qta": float,
+        #    "tipo": str, "modalita": str|None}
+        self._prodotti_selezionati: list[dict] = []
         self.setWindowTitle("Nuovo Trattamento")
-        self.setMinimumWidth(650)
+        self.setMinimumWidth(700)
         layout = QVBoxLayout(self)
 
         # Campi input principali
         self.date_edit = QDateEdit(QDate.currentDate())
         self.date_edit.setCalendarPopup(True)
-        self.input_operatore = QLineEdit()
-        self.input_operatore.setPlaceholderText("Nome dell'operatore...")
+        # Operatore: dropdown popolato dalla tabella `utenti` server-side
+        # (GET /utenti). Il combo è editabile come fallback se la lista non
+        # carica (server offline o utente non in elenco), così l'utente può
+        # sempre digitare a mano un nome libero senza bloccare il salvataggio.
+        self.combo_operatore = QComboBox()
+        self.combo_operatore.setEditable(True)
+        self.combo_operatore.setPlaceholderText("Operatore...")
+        self.combo_operatore.lineEdit().setPlaceholderText("Operatore...")
 
+        # --- Riga selezione prodotto: combo + qta + (modalità fert.) + Aggiungi
         self.combo_prodotto = QComboBox()
+        self.spin_qta_picker = QDoubleSpinBox()
+        self.spin_qta_picker.setRange(0.0, 99999.99)
+        self.spin_qta_picker.setDecimals(4)
+        self.combo_modalita_fert = QComboBox()
+        self.combo_modalita_fert.addItems([
+            "— Modalità —", "Fertirrigazione", "Radicale", "Fogliare"
+        ])
+        self.combo_modalita_fert.setVisible(False)
+        self.btn_aggiungi_prodotto = QPushButton("➕ Aggiungi")
+        self.btn_aggiungi_prodotto.clicked.connect(self._aggiungi_prodotto_selezionato)
+
+        h_prod = QHBoxLayout()
+        h_prod.addWidget(self.combo_prodotto, stretch=3)
+        h_prod.addWidget(self.spin_qta_picker, stretch=1)
+        h_prod.addWidget(self.combo_modalita_fert, stretch=2)
+        h_prod.addWidget(self.btn_aggiungi_prodotto)
+
+        # Lista prodotti già aggiunti
+        self.list_prodotti_sel = QListWidget()
+        self.list_prodotti_sel.setMaximumHeight(120)
 
         # Selezione Posizione a Cascata
         self.combo_azienda = QComboBox()
@@ -2045,16 +2137,39 @@ class DialogNuovoTrattamento(QDialog):
         h_loc.addWidget(self.combo_agro)
         h_loc.addWidget(self.combo_contrada)
 
-        # Lista Tendoni con Checkbox
+        # Lista Tendoni con Checkbox.
+        # Style esplicito sugli ::indicator: senza, lo stile di default Qt
+        # disegna un check appena visibile (bianco su bianco) e l'utente non
+        # capisce se ha spuntato o no. Soluzione: bordo scuro quando non
+        # spuntato, fill verde pieno quando spuntato (stesso schema delle
+        # WidgetTrattamentoCard). Il contrasto colore basta a comunicare lo
+        # stato senza dover specificare un pixmap interno per il segno di
+        # spunta — Qt avrebbe richiesto un'icona esterna che non vogliamo
+        # gestire come asset.
         self.list_tendoni = QListWidget()
+        self.list_tendoni.setStyleSheet("""
+            QListWidget::item {
+                padding: 4px 6px;
+            }
+            QListWidget::indicator {
+                width: 18px;
+                height: 18px;
+                border: 2px solid #757575;
+                border-radius: 3px;
+                background-color: white;
+            }
+            QListWidget::indicator:hover {
+                border: 2px solid #2E7D32;
+            }
+            QListWidget::indicator:checked {
+                background-color: #2E7D32;
+                border: 2px solid #2E7D32;
+            }
+        """)
         self.lbl_riepilogo = QLabel("Ettari Selezionati: 0.0000 ha")
         self.lbl_riepilogo.setStyleSheet("font-weight: bold; color: #2196F3;")
 
-        # Dosi e Botti
-        self.spin_qta_totale = QDoubleSpinBox()
-        self.spin_qta_totale.setRange(0.00, 99999.99)
-        self.spin_qta_totale.setDecimals(4)
-
+        # Botti totali — globali per l'intera operazione (anche multi-prodotto)
         self.spin_botti = QDoubleSpinBox()
         self.spin_botti.setRange(0.0, 9999.9)
         self.spin_botti.setSuffix(" Botti")
@@ -2063,21 +2178,21 @@ class DialogNuovoTrattamento(QDialog):
         layout.addWidget(QLabel("<b>Data Trattamento:</b>"))
         layout.addWidget(self.date_edit)
         layout.addWidget(QLabel("<b>Operatore:</b>"))
-        layout.addWidget(self.input_operatore)
-        layout.addWidget(QLabel("<b>Prodotto:</b>"))
-        layout.addWidget(self.combo_prodotto)
+        layout.addWidget(self.combo_operatore)
+        layout.addWidget(QLabel("<b>Prodotti</b> (aggiungine uno o più):"))
+        layout.addLayout(h_prod)
+        layout.addWidget(self.list_prodotti_sel)
         layout.addWidget(QLabel("<b>Filtra per Posizione:</b>"))
         layout.addLayout(h_loc)
         layout.addWidget(QLabel("<b>Seleziona Tendoni:</b>"))
         layout.addWidget(self.list_tendoni)
         layout.addWidget(self.lbl_riepilogo)
 
-        h_dosi = QHBoxLayout()
-        h_dosi.addWidget(QLabel("<b>Quantità Totale:</b>"))
-        h_dosi.addWidget(self.spin_qta_totale)
-        h_dosi.addWidget(QLabel("<b>N. Botti:</b>"))
-        h_dosi.addWidget(self.spin_botti)
-        layout.addLayout(h_dosi)
+        h_botti = QHBoxLayout()
+        h_botti.addWidget(QLabel("<b>N. Botti totali:</b>"))
+        h_botti.addWidget(self.spin_botti)
+        h_botti.addStretch()
+        layout.addLayout(h_botti)
 
         btn_salva = QPushButton("💾 REGISTRA TRATTAMENTO")
         btn_salva.setProperty('class', 'success')
@@ -2090,15 +2205,123 @@ class DialogNuovoTrattamento(QDialog):
         self.combo_agro.currentIndexChanged.connect(self.carica_contrade)
         self.combo_contrada.currentIndexChanged.connect(self.carica_tendoni)
         self.list_tendoni.itemChanged.connect(self.gestisci_spunta)
+        self.combo_prodotto.currentIndexChanged.connect(self._on_prodotto_picker_changed)
 
         self._inizializza_dati()
 
     def _inizializza_dati(self):
         with self.engine.connect() as conn:
-            for p in conn.execute(text("SELECT id, nome_prodotto, unita_misura FROM prodotti ORDER BY nome_prodotto")).fetchall():
-                self.combo_prodotto.addItem(p[1], userData={'id': p[0], 'um': p[2]})
+            # Includiamo `categoria` per pilotare visibilità modalità fertilizzazione.
+            for p in conn.execute(text(
+                "SELECT id, nome_prodotto, unita_misura, categoria FROM prodotti "
+                "ORDER BY nome_prodotto"
+            )).fetchall():
+                self.combo_prodotto.addItem(
+                    p[1],
+                    userData={'id': p[0], 'um': p[2] or '', 'categoria': (p[3] or '').strip()}
+                )
             for az in conn.execute(text("SELECT id, nome FROM aziende ORDER BY nome")).fetchall():
                 self.combo_azienda.addItem(az[1], userData=az[0])
+
+        # Lista utenti per la dropdown "Operatore". Fetch on-demand dal server
+        # via api_client.get_utenti: gli utenti non sono replicati in locale
+        # (tabella non sincronizzata). In caso di errore di rete o token, il
+        # combo resta editabile come fallback (l'utente può digitare).
+        self._popola_operatori()
+
+    def _popola_operatori(self):
+        """Fetch GET /utenti e popola `combo_operatore`. Best-effort: errore
+        di rete o token scaduto → combo vuoto + placeholder, l'utente può
+        comunque digitare a mano (editable=True)."""
+        parent = self.parent()
+        api = getattr(parent, "api", None)
+        if api is None:
+            return
+        try:
+            utenti = api.get_utenti()
+        except Exception:
+            # NetworkError/ApiError/auth: il dialog continua con campo libero.
+            # Non blocchiamo l'inserimento: l'operatore potrebbe avere un
+            # nome non in elenco (es. soggetto esterno occasionale).
+            return
+        if not utenti:
+            return
+        self.combo_operatore.clear()
+        for u in utenti:
+            label = u.get("display_name") or u.get("username") or ""
+            if not label:
+                continue
+            self.combo_operatore.addItem(label)
+
+    def _on_prodotto_picker_changed(self, _idx: int):
+        """Mostra il combo modalità fertilizzazione solo per prodotti Fert."""
+        dati = self.combo_prodotto.currentData()
+        is_fert = isinstance(dati, dict) and dati.get('categoria') == 'Fert'
+        self.combo_modalita_fert.setVisible(is_fert)
+        if not is_fert:
+            self.combo_modalita_fert.setCurrentIndex(0)
+
+    def _aggiungi_prodotto_selezionato(self):
+        """Sposta il prodotto correntemente nel combo dentro la lista selezionati."""
+        dati = self.combo_prodotto.currentData()
+        if not isinstance(dati, dict):
+            return
+        qta = self.spin_qta_picker.value()
+        if qta <= 0:
+            QMessageBox.warning(self, "Quantità mancante",
+                                "Inserisci una quantità maggiore di 0 per il prodotto.")
+            return
+        if any(ps['id'] == dati['id'] for ps in self._prodotti_selezionati):
+            QMessageBox.information(self, "Già aggiunto",
+                                    "Questo prodotto è già nella lista.")
+            return
+
+        is_fert = (dati.get('categoria') or '') == 'Fert'
+        modalita = None
+        if is_fert:
+            if self.combo_modalita_fert.currentIndex() == 0:
+                QMessageBox.warning(self, "Modalità mancante",
+                                    "Seleziona la modalità di fertilizzazione.")
+                return
+            modalita = self.combo_modalita_fert.currentText()
+        tipo = "Fertilizzazione" if is_fert else "Difesa"
+
+        nome = self.combo_prodotto.currentText()
+        self._prodotti_selezionati.append({
+            'id': dati['id'], 'nome': nome, 'um': dati.get('um', ''),
+            'qta': qta, 'tipo': tipo, 'modalita': modalita,
+        })
+        self._ridisegna_lista_prodotti_sel()
+
+        # Reset picker
+        self.spin_qta_picker.setValue(0.0)
+        self.combo_prodotto.setCurrentIndex(0)
+        self.combo_modalita_fert.setCurrentIndex(0)
+
+    def _ridisegna_lista_prodotti_sel(self):
+        self.list_prodotti_sel.clear()
+        for ps in self._prodotti_selezionati:
+            um_simple = (ps['um'].split('/')[0] if '/' in ps['um'] else ps['um']) or ''
+            extra = f" — {ps['modalita']}" if ps.get('modalita') else ''
+            item = QListWidgetItem(
+                f"➤ {ps['nome']} — {ps['qta']:.4g} {um_simple}{extra}    "
+                f"(doppio click per rimuovere)"
+            )
+            item.setData(Qt.ItemDataRole.UserRole, ps['id'])
+            self.list_prodotti_sel.addItem(item)
+        # Doppio click per rimuovere — collegato una sola volta.
+        try:
+            self.list_prodotti_sel.itemDoubleClicked.disconnect()
+        except (TypeError, RuntimeError):
+            pass
+        self.list_prodotti_sel.itemDoubleClicked.connect(self._rimuovi_prodotto_sel)
+
+    def _rimuovi_prodotto_sel(self, item: QListWidgetItem):
+        pid = item.data(Qt.ItemDataRole.UserRole)
+        self._prodotti_selezionati = [
+            ps for ps in self._prodotti_selezionati if ps['id'] != pid
+        ]
+        self._ridisegna_lista_prodotti_sel()
 
     def carica_agri(self):
         self.combo_agro.clear()
@@ -2143,63 +2366,43 @@ class DialogNuovoTrattamento(QDialog):
 
     def salva(self):
         tendoni_sel = list(self._selezione.values())
-        if not tendoni_sel or self.spin_qta_totale.value() <= 0:
-            QMessageBox.warning(self, "Attenzione", "Seleziona almeno un tendone e inserisci la quantità del prodotto.")
+        if not tendoni_sel:
+            QMessageBox.warning(self, "Attenzione", "Seleziona almeno un tendone.")
+            return
+        if not self._prodotti_selezionati:
+            QMessageBox.warning(self, "Attenzione",
+                                "Aggiungi almeno un prodotto alla lista (➕ Aggiungi).")
             return
 
         tot_area = sum(d['e'] for d in tendoni_sel)
-        dati_prod = self.combo_prodotto.currentData()
-        qta_tot = self.spin_qta_totale.value()
-        botti_tot = self.spin_botti.value()
+        if tot_area <= 0:
+            QMessageBox.warning(self, "Attenzione", "Ettari totali = 0.")
+            return
 
-        # Calcolo Dose Applicata
-        if '/hl' in dati_prod.get('um', '').lower():
-            divisore = (botti_tot if botti_tot > 0 else tot_area) * 10.0
-            dose_ha = round(qta_tot / divisore, 4) if divisore > 0 else 0
-        else:
-            dose_ha = round(qta_tot / tot_area, 4) if tot_area > 0 else 0
+        botti_tot = self.spin_botti.value()
+        operatore_val = self.combo_operatore.currentText().strip()
+        data_tratt = self.date_edit.date().toPyDate()
+        data_ins = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+
+        is_multi = len(self._prodotti_selezionati) > 1
 
         try:
-            # Sospende il timer del parent per sicurezza extra
+            # Sospende il timer del parent: senza, il sync potrebbe partire a
+            # metà inserimento e creare race con la INSERT in corso.
             if self.parent() and hasattr(self.parent(), 'timer_autosync'):
                 self.parent().timer_autosync.stop()
 
-            with self.engine.begin() as conn:
-                # 1. Testata
-                res = conn.execute(text("""
-                    INSERT INTO trattamenti (data_trattamento, data_inserimento, prodotto_id, operatore, tipo_trattamento)
-                    VALUES (:d, :di, :p, :o, 'Difesa')
-                """), {
-                    "d": self.date_edit.date().toPyDate(),
-                    "di": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
-                    "p": dati_prod['id'],
-                    "o": self.input_operatore.text().strip()
-                })
-                tratt_id = res.lastrowid
+            if is_multi:
+                self._salva_operazione_multi(
+                    tendoni_sel, tot_area, botti_tot,
+                    operatore_val, data_tratt, data_ins,
+                )
+            else:
+                self._salva_trattamento_singolo(
+                    tendoni_sel, tot_area, botti_tot,
+                    operatore_val, data_tratt, data_ins,
+                )
 
-                # 2. Dettagli
-                for t in tendoni_sel:
-                    pro_quota = t['e'] / tot_area
-                    conn.execute(text("""
-                        INSERT INTO dettaglio_trattamenti (trattamento_id, tendone_id, quantita_sostanza, botti, dose_ha, is_bilanciamento)
-                        VALUES (:tr, :te, :q, :b, :d, 0)
-                    """), {
-                        "tr": tratt_id, "te": t['id'], "q": round(qta_tot * pro_quota, 4),
-                        "b": round(botti_tot * pro_quota, 4), "d": dose_ha
-                    })
-
-                # Tutto dentro al with usando 'conn'
-                payload = _build_trattamento_payload(conn, tratt_id)
-                if payload:
-                    enqueue_operation(conn, "TRATTAMENTO", "INSERT", entity_id=tratt_id, payload=payload)
-
-                # Scarico magazzino nel REALE (il trattamento è in Storico,
-                # is_aut=0). Il fittizio verrà popolato solo alla revisione.
-                scarica_reale(conn, tratt_id)
-                ricalcola_avvisi_globali(conn)
-
-            # Riabilita il timer (usa CONFIG.autosync_ms, non un valore hardcoded
-            # che era divergente).
             if self.parent() and hasattr(self.parent(), 'timer_autosync'):
                 self.parent().timer_autosync.start(CONFIG.autosync_ms)
             self.accept()
@@ -2209,12 +2412,175 @@ class DialogNuovoTrattamento(QDialog):
                 self.parent().timer_autosync.start(CONFIG.autosync_ms)
             QMessageBox.critical(self, "Errore Database", str(e))
 
+    @staticmethod
+    def _distribuisci_con_delta(totale: float, pro_quote: list[float]) -> list[float]:
+        """Distribuisce `totale` su N elementi proporzionalmente a `pro_quote`,
+        con l'ultimo che assorbe il delta di rounding. SUM(risultato) = totale
+        esatto. Stesso algoritmo dell'app Android (vedi
+        NuovoTrattamentoFragment.distribuiscoConDeltaAssorbito)."""
+        if not pro_quote:
+            return []
+        n = len(pro_quote)
+        risultato = [0.0] * n
+        accumulato = 0.0
+        for i in range(n - 1):
+            risultato[i] = round(totale * pro_quote[i], 4)
+            accumulato += risultato[i]
+        risultato[n - 1] = round(totale - accumulato, 4)
+        return risultato
+
+    def _salva_trattamento_singolo(self, tendoni_sel, tot_area, botti_tot,
+                                    operatore, data_tratt, data_ins):
+        """Singolo prodotto → vecchio flusso `POST /trattamenti`."""
+        ps = self._prodotti_selezionati[0]
+        qta_tot = ps['qta']
+        um = (ps['um'] or '').lower()
+
+        # Calcolo Dose Applicata
+        if '/hl' in um:
+            divisore = (botti_tot if botti_tot > 0 else tot_area) * 10.0
+            dose_ha = round(qta_tot / divisore, 4) if divisore > 0 else 0
+        else:
+            dose_ha = round(qta_tot / tot_area, 4) if tot_area > 0 else 0
+
+        pro_quote = [t['e'] / tot_area for t in tendoni_sel]
+        qta_per_ten = self._distribuisci_con_delta(qta_tot, pro_quote)
+        botti_per_ten = self._distribuisci_con_delta(botti_tot, pro_quote) if botti_tot > 0 else None
+
+        with self.engine.begin() as conn:
+            res = conn.execute(text("""
+                INSERT INTO trattamenti (data_trattamento, data_inserimento, prodotto_id, operatore, tipo_trattamento, modalita_fertilizzazione)
+                VALUES (:d, :di, :p, :o, :tt, :mf)
+            """), {
+                "d": data_tratt, "di": data_ins,
+                "p": ps['id'], "o": operatore,
+                "tt": ps['tipo'], "mf": ps['modalita'],
+            })
+            tratt_id = res.lastrowid
+
+            for i, t in enumerate(tendoni_sel):
+                conn.execute(text("""
+                    INSERT INTO dettaglio_trattamenti (trattamento_id, tendone_id, quantita_sostanza, botti, dose_ha, is_bilanciamento)
+                    VALUES (:tr, :te, :q, :b, :d, 0)
+                """), {
+                    "tr": tratt_id, "te": t['id'],
+                    "q": qta_per_ten[i],
+                    "b": botti_per_ten[i] if botti_per_ten else 0,
+                    "d": dose_ha,
+                })
+
+            payload = _build_trattamento_payload(conn, tratt_id)
+            if payload:
+                enqueue_operation(conn, "TRATTAMENTO", "INSERT",
+                                  entity_id=tratt_id, payload=payload)
+            scarica_reale(conn, tratt_id)
+            ricalcola_avvisi_globali(conn)
+
+    def _salva_operazione_multi(self, tendoni_sel, tot_area, botti_tot,
+                                 operatore, data_tratt, data_ins):
+        """Multi-prodotto → `POST /operazioni` atomico.
+
+        Crea localmente N trattamenti che condividono un `operazione_id`
+        temporaneo NEGATIVO (per il grouping pre-upload, simile al parking
+        degli id locali in pending_uploader). Accoda UNA pending
+        OPERAZIONE-INSERT: il server alloca l'operazione_id reale
+        (positivo) e il pending_uploader fa lo swap di N ID trattamento +
+        applica il nuovo operazione_id a tutti.
+        """
+        n_prodotti = len(self._prodotti_selezionati)
+
+        # operazione_id temporaneo negativo (sotto MIN esistente) per evitare
+        # collisioni con valori server-assegnati positivi. Se in futuro il
+        # DB viene wipato e ricreato, il -1 può essere riusato — nessun
+        # problema perché l'id temporaneo serve solo finché non gira il
+        # primo sync (che lo swappa col positivo).
+        with self.engine.connect() as conn:
+            min_existing = conn.execute(text(
+                "SELECT COALESCE(MIN(operazione_id), 0) FROM trattamenti"
+            )).scalar() or 0
+        operazione_id_temp = int(min_existing) - 1 if min_existing < 0 else -1
+
+        # Ripartizione botti tra prodotti (delta assorbito sull'ultimo).
+        pro_quote_prod = [1.0 / n_prodotti] * n_prodotti
+        botti_per_prod = (
+            self._distribuisci_con_delta(botti_tot, pro_quote_prod)
+            if botti_tot > 0 else [0.0] * n_prodotti
+        )
+        pro_quote_ten = [t['e'] / tot_area for t in tendoni_sel]
+
+        from trattamenti_payload import build_operazione_payload
+
+        local_ids: list[int] = []
+        with self.engine.begin() as conn:
+            for idx, ps in enumerate(self._prodotti_selezionati):
+                um = (ps['um'] or '').lower()
+                botti_prod = botti_per_prod[idx]
+                if '/hl' in um:
+                    divisore = (botti_prod if botti_prod > 0 else tot_area) * 10.0
+                    dose_ha = round(ps['qta'] / divisore, 4) if divisore > 0 else 0
+                else:
+                    dose_ha = round(ps['qta'] / tot_area, 4) if tot_area > 0 else 0
+
+                res = conn.execute(text("""
+                    INSERT INTO trattamenti (data_trattamento, data_inserimento, prodotto_id,
+                        operatore, tipo_trattamento, modalita_fertilizzazione, operazione_id)
+                    VALUES (:d, :di, :p, :o, :tt, :mf, :op)
+                """), {
+                    "d": data_tratt, "di": data_ins,
+                    "p": ps['id'], "o": operatore,
+                    "tt": ps['tipo'], "mf": ps['modalita'],
+                    "op": operazione_id_temp,
+                })
+                tratt_id = res.lastrowid
+                local_ids.append(tratt_id)
+
+                qta_per_ten = self._distribuisci_con_delta(ps['qta'], pro_quote_ten)
+                botti_per_ten = (
+                    self._distribuisci_con_delta(botti_prod, pro_quote_ten)
+                    if botti_prod > 0 else None
+                )
+
+                for i, t in enumerate(tendoni_sel):
+                    conn.execute(text("""
+                        INSERT INTO dettaglio_trattamenti (trattamento_id, tendone_id, quantita_sostanza, botti, dose_ha, is_bilanciamento)
+                        VALUES (:tr, :te, :q, :b, :d, 0)
+                    """), {
+                        "tr": tratt_id, "te": t['id'],
+                        "q": qta_per_ten[i],
+                        "b": botti_per_ten[i] if botti_per_ten else 0,
+                        "d": dose_ha,
+                    })
+                scarica_reale(conn, tratt_id)
+
+            ricalcola_avvisi_globali(conn)
+
+            # UNA sola pending OPERAZIONE-INSERT. Il server allocherà
+            # `operazione_id` definitivo (intero positivo); il pending_uploader
+            # farà N swap dei trattamento_id + applicherà il nuovo
+            # operazione_id a tutti (sostituendo il temp negativo). Vedi
+            # _apply_operazione_swap in pending_uploader.py.
+            payload = build_operazione_payload(conn, local_ids)
+            if payload:
+                enqueue_operation(conn, "OPERAZIONE", "INSERT",
+                                  entity_id=local_ids[0], payload=payload)
+
 
 class DialogModificaTrattamento(DialogNuovoTrattamento):
+    """Modifica trattamento singolo. La modifica di operazioni multi-prodotto
+    dal desktop non è supportata in questa iterazione (è disponibile su Android).
+
+    Riusa la UI del NuovoTrattamento ma nasconde i controlli di aggiunta
+    prodotto (lista multi). Il `spin_qta_picker` diventa la "qta totale"
+    classica del prodotto fissato. La salva esegue UPDATE invece di INSERT.
+    """
+
     def __init__(self, engine, trattamento_id, parent=None):
         super().__init__(engine, parent)
         self.trattamento_id = trattamento_id
         self.setWindowTitle(f"Modifica Trattamento #{trattamento_id}")
+        # Niente add/list multi-prodotto in modalità modifica.
+        self.btn_aggiungi_prodotto.setVisible(False)
+        self.list_prodotti_sel.setVisible(False)
         self._carica_dati_esistenti()
 
     def _carica_dati_esistenti(self):
@@ -2230,7 +2596,7 @@ class DialogModificaTrattamento(DialogNuovoTrattamento):
                 return
 
             self.date_edit.setDate(QDate.fromString(str(t['data_trattamento']), Qt.DateFormat.ISODate))
-            self.input_operatore.setText(t['operatore'] or "")
+            self.combo_operatore.setCurrentText(t['operatore'] or "")
 
             for i in range(self.combo_prodotto.count()):
                 if self.combo_prodotto.itemData(i).get('id') == t['prodotto_id']:
@@ -2247,7 +2613,9 @@ class DialogModificaTrattamento(DialogNuovoTrattamento):
             qta_tot = sum(d[1] for d in dettagli)
             botti_tot = sum(d[2] or 0 for d in dettagli)
 
-            self.spin_qta_totale.setValue(qta_tot)
+            # In modalità modifica il picker è in pratica il "qta totale" del
+            # prodotto fissato (vedi nota nel docstring della classe).
+            self.spin_qta_picker.setValue(qta_tot)
             self.spin_botti.setValue(botti_tot)
 
             # In Revisionati, blocchiamo la modifica di tutto tranne la testata
@@ -2257,14 +2625,14 @@ class DialogModificaTrattamento(DialogNuovoTrattamento):
                 self.combo_agro.setEnabled(False)
                 self.combo_contrada.setEnabled(False)
                 self.list_tendoni.setEnabled(False)
-                self.spin_qta_totale.setEnabled(False)
+                self.spin_qta_picker.setEnabled(False)
                 self.spin_botti.setEnabled(False)
                 self.setWindowTitle(f"Modifica Autorizzato #{self.trattamento_id} (Solo Testata)")
 
     def salva(self):
         """Sovrascrive la logica di salvataggio per eseguire un UPDATE."""
         tendoni_sel = list(self._selezione.values())
-        if not tendoni_sel or self.spin_qta_totale.value() <= 0:
+        if not tendoni_sel or self.spin_qta_picker.value() <= 0:
             QMessageBox.warning(self, "Attenzione", "Seleziona almeno un tendone.")
             return
 
@@ -2281,7 +2649,7 @@ class DialogModificaTrattamento(DialogNuovoTrattamento):
 
         tot_area = sum(d['e'] for d in tendoni_sel)
         dati_prod = self.combo_prodotto.currentData()
-        qta_tot = self.spin_qta_totale.value()
+        qta_tot = self.spin_qta_picker.value()
         botti_tot = self.spin_botti.value()
 
         if '/hl' in dati_prod.get('um', '').lower():
@@ -2302,7 +2670,7 @@ class DialogModificaTrattamento(DialogNuovoTrattamento):
                 """), {
                     "d": self.date_edit.date().toPyDate(),
                     "p": dati_prod['id'],
-                    "o": self.input_operatore.text().strip(),
+                    "o": self.combo_operatore.currentText().strip(),
                     "id": self.trattamento_id
                 })
 

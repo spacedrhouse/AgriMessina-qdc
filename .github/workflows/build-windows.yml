@@ -98,6 +98,10 @@ jobs:
         uses: softprops/action-gh-release@v2
         with:
           files: installer/output/*.exe
-          generate_release_notes: true
+          # `generate_release_notes` rimosso: senza, softprops/action-gh-release
+          # legge direttamente l'annotation message del tag (il -m di
+          # `git tag -a`) e lo usa come body della release. Con quel flag attivo
+          # le release notes erano sostituite dal preset GitHub auto-generato
+          # (lista PR/commit), perdendo il commento manuale del tag.
           name: AgriMessina QDC ${{ steps.version.outputs.version }}
           tag_name: ${{ github.ref_name }}

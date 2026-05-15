@@ -32,9 +32,14 @@ def build_trattamento_payload(engine_or_conn, trattamento_id, *,
 
 
 def _esegui_build_payload(conn, trattamento_id, include_is_autorizzato: bool):
+    # `operazione_id` è server-allocated alla creazione e non viene inviato
+    # nel payload outbound: il server lo ignora comunque (vedi
+    # routers/trattamenti_router.py:create_trattamento). Lo legge solo il
+    # desktop via sync downstream per il display.
     t = conn.execute(text(
         "SELECT data_trattamento, prodotto_id, operatore, tipo_trattamento, "
-        "modalita_fertilizzazione, is_autorizzato, data_inserimento, scaricato_magazzino "
+        "modalita_fertilizzazione, is_autorizzato, data_inserimento, "
+        "scaricato_magazzino "
         "FROM trattamenti WHERE id = :id"
     ), {"id": trattamento_id}).first()
     if not t:
@@ -81,3 +86,44 @@ def _esegui_build_payload(conn, trattamento_id, include_is_autorizzato: bool):
     if include_is_autorizzato:
         payload["is_autorizzato"] = int(t[5] or 0)
     return payload
+
+
+def build_operazione_payload(engine_or_conn,
+                              local_trattamento_ids: list[int]) -> dict | None:
+    """Ritorna il dict per `POST /operazioni` + i local_ids per lo swap.
+
+    Formato:
+        {
+            "operazione": {"trattamenti": [...]},  # operazione_id allocato dal server
+            "local_ids": [id_locale_1, id_locale_2, ...]
+        }
+
+    Lato server (operazioni_router.create_operazione) alloca `operazione_id`
+    e lo applica a tutti gli N trattamenti del bundle. Il `local_ids` resta
+    nel payload locale e viene usato dal pending_uploader durante lo swap
+    post-success (mappa N locali ↔ N server-side).
+    """
+    if not local_trattamento_ids:
+        return None
+    if hasattr(engine_or_conn, "execute"):
+        return _esegui_build_operazione(engine_or_conn, local_trattamento_ids)
+    with engine_or_conn.connect() as conn:
+        return _esegui_build_operazione(conn, local_trattamento_ids)
+
+
+def _esegui_build_operazione(conn, local_ids: list[int]) -> dict | None:
+    trattamenti = []
+    for tid in local_ids:
+        # `include_is_autorizzato=False` perché lato POST /operazioni il flag
+        # is_autorizzato non è accettato (server-controlled, default 0).
+        p = _esegui_build_payload(conn, tid, include_is_autorizzato=False)
+        if p is None:
+            continue
+        trattamenti.append(p)
+    if not trattamenti:
+        return None
+    return {
+        # operazione_id non incluso: server alloca il proprio progressivo.
+        "operazione": {"trattamenti": trattamenti},
+        "local_ids": list(local_ids),
+    }
