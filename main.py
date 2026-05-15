@@ -915,9 +915,12 @@ class FinestraPrincipale(QMainWindow):
     def _on_update_available(self, info: UpdateInfo):
         """Notifica all'utente che c'è una versione più recente disponibile.
 
-        Non forziamo nulla: chiediamo se vuole aprire la pagina di download.
-        L'app continua a funzionare normalmente anche se l'utente sceglie
-        "più tardi" — il check si ripeterà al prossimo avvio.
+        Tre azioni possibili:
+          - "Aggiorna e riavvia": auto-download + installer silent + restart
+            (vedi auto_updater.apply_update). Path raccomandato.
+          - "Apri pagina download": fallback per chi preferisce installare
+            manualmente o se l'asset .exe non è disponibile.
+          - "Più tardi": skip, il check si ripeterà al prossimo avvio.
         """
         msg = QMessageBox(self)
         msg.setIcon(QMessageBox.Icon.Information)
@@ -931,17 +934,85 @@ class FinestraPrincipale(QMainWindow):
         )
         if notes_excerpt:
             msg.setInformativeText(f"Novità:\n{notes_excerpt}")
-        btn_download = msg.addButton("Scarica", QMessageBox.ButtonRole.AcceptRole)
+
+        btn_install = msg.addButton("⚡ Aggiorna e riavvia", QMessageBox.ButtonRole.AcceptRole)
+        btn_browser = msg.addButton("Apri pagina download", QMessageBox.ButtonRole.AcceptRole)
         msg.addButton("Più tardi", QMessageBox.ButtonRole.RejectRole)
+        # Default sull'auto-update: l'utente preme Invio e ottiene il flow consigliato.
+        msg.setDefaultButton(btn_install)
         msg.exec()
 
-        if msg.clickedButton() is btn_download:
+        clicked = msg.clickedButton()
+        if clicked is btn_install:
+            if not info.download_url:
+                # CI failure (release senza asset .exe). Degradiamo al browser.
+                QMessageBox.warning(
+                    self, "File installer non trovato",
+                    "Questa release non contiene un installer scaricabile.\n"
+                    "Apro la pagina della release per il download manuale.",
+                )
+                import webbrowser
+                webbrowser.open(info.release_url)
+                return
+            self._start_auto_update(info)
+        elif clicked is btn_browser:
             import webbrowser
-            # Se l'asset .exe non c'è nella release (es. build CI fallita),
-            # ripieghiamo sulla pagina della release: l'utente vede comunque
-            # cosa c'è e può scaricare manualmente.
-            url = info.download_url or info.release_url
-            webbrowser.open(url)
+            webbrowser.open(info.download_url or info.release_url)
+
+    def _start_auto_update(self, info: UpdateInfo):
+        """Avvia il download dell'installer + lo lancia silenzioso + esce.
+
+        Mostra QProgressDialog durante il download. Cancellazione: stop al
+        worker (è ok perché stiamo scaricando in temp, non rompiamo nulla).
+        """
+        from PyQt6.QtWidgets import QProgressDialog
+        from auto_updater import UpdateDownloadWorker, apply_update
+
+        progress = QProgressDialog(
+            "Scarico aggiornamento...", "Annulla", 0, 100, self
+        )
+        progress.setWindowTitle(f"Aggiornamento a {info.latest_version}")
+        progress.setMinimumDuration(0)
+        progress.setAutoClose(False)
+        progress.setAutoReset(False)
+
+        worker = UpdateDownloadWorker(info.download_url, parent=self)
+
+        def on_progress(done, total):
+            if total > 0:
+                progress.setValue(int(done * 100 / total))
+                progress.setLabelText(
+                    f"Scarico aggiornamento... "
+                    f"{done // (1024 * 1024)} MB / {total // (1024 * 1024)} MB"
+                )
+            else:
+                progress.setLabelText(
+                    f"Scarico aggiornamento... {done // (1024 * 1024)} MB"
+                )
+
+        def on_finished(path):
+            progress.close()
+            QMessageBox.information(
+                self, "Installazione in corso",
+                "Il download è completato. AgriMessina si chiuderà e verrà "
+                "installata la nuova versione. L'app si riaprirà al termine "
+                "in automatico.",
+            )
+            apply_update(path)  # → sys.exit dentro
+
+        def on_failed(err):
+            progress.close()
+            QMessageBox.critical(
+                self, "Errore aggiornamento",
+                f"Impossibile scaricare l'aggiornamento:\n{err}\n\n"
+                "Riprova più tardi o usa 'Apri pagina download'.",
+            )
+
+        worker.progress.connect(on_progress)
+        worker.finished_ok.connect(on_finished)
+        worker.failed.connect(on_failed)
+        progress.canceled.connect(worker.cancel)
+        worker.start()
 
     def _handle_session_expired(self):
         """Gestisce la scadenza del token JWT.

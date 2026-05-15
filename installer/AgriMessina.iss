@@ -71,6 +71,14 @@ Name: "{group}\{cm:UninstallProgram,{#AppName}}"; Filename: "{uninstallexe}"
 Name: "{autodesktop}\{#AppName}"; Filename: "{app}\{#AppExeName}"
 
 [Run]
+; Modalità interattiva: checkbox "Apri AgriMessina" sull'ultima pagina del wizard.
 Filename: "{app}\{#AppExeName}"; \
     Description: "{cm:LaunchProgram,{#StringChange(AppName, '&', '&&')}}"; \
     Flags: nowait postinstall skipifsilent
+; Modalità /SILENT (auto-updater dell'app): nessuna Finish page, quindi la
+; checkbox sopra viene ignorata. Questa entry forza il rilancio quando lo
+; setup gira silenzioso. `runasoriginaluser` evita che l'app ereditasse
+; i privilegi admin dell'installer.
+Filename: "{app}\{#AppExeName}"; \
+    Flags: nowait runasoriginaluser; \
+    Check: WizardSilent
