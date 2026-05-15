@@ -1000,14 +1000,21 @@ class SchedaOperazioni(QWidget):
                                 SELECT ROUND(
                                     CASE
                                         WHEN LOWER(p2.unita_misura) LIKE '%/hl' THEN
-                                            SUM(dt2.quantita_sostanza) / (
-                                                CASE WHEN COALESCE(SUM(CASE WHEN dt2.botti > 0 THEN dt2.botti ELSE 0 END), 0) > 0
-                                                     THEN SUM(CASE WHEN dt2.botti > 0 THEN dt2.botti ELSE 0 END) * 10.0
-                                                     ELSE ten2.ettari * 10.0
-                                                END
-                                            )
+                                            CASE WHEN COALESCE(SUM(CASE WHEN dt2.botti > 0 THEN dt2.botti ELSE 0 END), 0) > 0
+                                                 THEN SUM(dt2.quantita_sostanza)
+                                                      / (SUM(CASE WHEN dt2.botti > 0 THEN dt2.botti ELSE 0 END) * 10.0)
+                                                 -- Fallback ettari × 10: protetto da check ettari > 0
+                                                 -- per evitare NULL silenzioso (tendone mal configurato
+                                                 -- con ettari=0 propagava NULL nella priorita_max).
+                                                 WHEN ten2.ettari > 0
+                                                 THEN SUM(dt2.quantita_sostanza) / (ten2.ettari * 10.0)
+                                                 ELSE 0
+                                            END
                                         ELSE
-                                            SUM(dt2.quantita_sostanza) / ten2.ettari
+                                            CASE WHEN ten2.ettari > 0
+                                                 THEN SUM(dt2.quantita_sostanza) / ten2.ettari
+                                                 ELSE 0
+                                            END
                                     END, 4
                                 )
                                 FROM dettaglio_trattamenti dt2
@@ -1136,18 +1143,27 @@ class SchedaOperazioni(QWidget):
               )
         """)).fetchall()
 
+        # Pattern stesso usato in `_esporta_selezionati`: cerca un blocco
+        # [<digits>] ovunque nella stringa. Vince l'ultimo match (rfind-like
+        # via list[-1]) — coerente col formato "SISTEMA: BILANCIAMENTO [123]"
+        # dove l'id padre è in coda. Vecchia implementazione `rfind('[')` /
+        # `rfind(']')` fallava silenziosa su "[abc]" o "[1][2]" perché
+        # estraeva substring non numerica e il ValueError veniva ignorato →
+        # il legame figlio↔padre andava perso e la sotto-card non compariva.
+        import re
+        pattern_id_padre = re.compile(r"\[(\d+)\]")
+
         for r in righe:
             id_figlio = r[0]
             op = r[1] or ""
-            try:
-                # Cerca l'ultimo blocco [ID] nella stringa
-                start = op.rfind('[') + 1
-                end = op.rfind(']')
-                if start > 0 and end > start:
-                    id_padre = int(op[start:end])
-                    mappa[id_figlio] = id_padre
-            except ValueError:
-                pass
+            matches = pattern_id_padre.findall(op)
+            if matches:
+                # In presenza di più [123][456], scegliamo l'ULTIMO (id padre
+                # appare in coda al formato di sistema).
+                try:
+                    mappa[id_figlio] = int(matches[-1])
+                except ValueError:
+                    log.warning("[mappa_padri] id padre non valido in operatore=%r", op)
 
         return mappa
 
@@ -1428,6 +1444,14 @@ class SchedaOperazioni(QWidget):
             QMessageBox.critical(
                 self, "Errore",
                 f"Manca la libreria '{missing}'.\nInstallala con: pip install {missing}",
+            )
+        except PermissionError:
+            # Caso comune: l'utente ha il file aperto in Excel/LibreOffice.
+            # Messaggio dedicato evita all'utente di pensare a un bug grave.
+            QMessageBox.critical(
+                self, "File in uso",
+                f"Impossibile scrivere il file:\n{f_p}\n\n"
+                "È aperto in Excel o LibreOffice. Chiudilo e riprova.",
             )
         except Exception as e:
             log.exception("Esportazione trattamenti fallita")

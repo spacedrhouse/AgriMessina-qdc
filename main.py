@@ -370,10 +370,19 @@ class FinestraPrincipale(QMainWindow):
             if timer is not None and timer.isActive():
                 timer.stop()
         # Stop SSE listener pulitamente, altrimenti l'app resta appesa sul thread.
+        # `wait(2000)` non garantisce la terminazione: se il thread è bloccato
+        # in una read HTTP che ignora il signal (rete giù, firewall che droppa
+        # senza FIN/RST), restiamo appesi finché il timeout `_READ_TIMEOUT_SECONDS`
+        # di httpx non scade (90s). Aggiungiamo un `quit()` forzato come fallback
+        # quando il wait non ottiene la conferma: invia un quit all'event loop
+        # del thread (QThread.quit) che è più forte di stop()-via-flag.
         events_listener = getattr(self, "events_listener", None)
         if events_listener is not None and events_listener.isRunning():
             events_listener.stop()
-            events_listener.wait(2000)
+            if not events_listener.wait(2000):
+                log.warning("EventsListener non terminato in 2s, forzo quit()")
+                events_listener.quit()
+                events_listener.wait(1000)
         # Update checker: se è ancora in corso (connessione GitHub lenta),
         # l'app può appendersi sul thread. Attendiamo brevemente.
         update_worker = getattr(self, "_update_worker", None)
@@ -1039,7 +1048,12 @@ class FinestraPrincipale(QMainWindow):
             events_listener = getattr(self, "events_listener", None)
             if events_listener and events_listener.isRunning():
                 events_listener.stop()
-                events_listener.wait(2000)
+                # Stesso fallback del closeEvent: se la read HTTP è bloccata,
+                # forziamo quit() per non lasciare l'app appesa sul re-login.
+                if not events_listener.wait(2000):
+                    log.warning("EventsListener non terminato in 2s, forzo quit()")
+                    events_listener.quit()
+                    events_listener.wait(1000)
 
             self.api.logout()
 

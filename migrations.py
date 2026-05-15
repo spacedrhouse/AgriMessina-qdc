@@ -199,13 +199,23 @@ def _migrate_v7(conn) -> None:
     ).fetchall()}
 
     # Step 1: drop operazione_id TEXT se ancora presente.
+    # SQLite 3.35+ supporta DROP COLUMN. Python 3.12 spedisce SQLite molto più
+    # nuovo, ma se per qualche motivo siamo su un binding vecchio (es. utenti
+    # con Python custom-build) il DROP fallisce: in quel caso preferiamo
+    # interrompere subito invece che proseguire con uno schema misto INT+TEXT
+    # che farebbe poi crashare le query downstream con "no such column" o
+    # type mismatch silenzioso.
     if "operazione_id" in cols and cols["operazione_id"] in ("TEXT", "VARCHAR", "CHAR"):
+        conn.execute(text("DROP INDEX IF EXISTS idx_t_operazione"))
         try:
-            conn.execute(text("DROP INDEX IF EXISTS idx_t_operazione"))
             conn.execute(text("ALTER TABLE trattamenti DROP COLUMN operazione_id"))
             log.info("[migration v7] drop colonna operazione_id (TEXT/UUID)")
-        except Exception as e:
-            log.warning("[migration v7] drop operazione_id fallito: %s", e)
+        except Exception:
+            log.exception(
+                "[migration v7] DROP COLUMN operazione_id fallito. "
+                "Probabile SQLite < 3.35. Migrazione interrotta."
+            )
+            raise
 
     # Re-read cols dopo drop.
     cols = {row[1] for row in conn.execute(

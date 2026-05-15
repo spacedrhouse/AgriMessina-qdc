@@ -613,10 +613,14 @@ def sync_all(api: ApiClient, engine: Engine) -> SyncResult:
         set_sync_since(engine, E_PRODOTTI, resp["server_time"])
 
         # 6) TRATTAMENTI
+        # Ordine: UPSERT prima, DELETE dopo (allineato alle altre entità).
+        # In caso patologico in cui lo stesso id compare sia in `items` sia in
+        # `deleted_ids` (race lato server), questo ordine garantisce che lo
+        # stato finale rifletta l'intento "delete" anziché ricomparire.
         since = get_sync_since(engine, E_TRATTAMENTI)
         resp = api.sync_trattamenti(since)
-        _delete_ids(engine, "trattamenti", resp.get("deleted_ids", []))
         _upsert_trattamenti(engine, resp.get("items", []))
+        _delete_ids(engine, "trattamenti", resp.get("deleted_ids", []))
         set_sync_since(engine, E_TRATTAMENTI, resp["server_time"])
 
         # 7) MAGAZZINO

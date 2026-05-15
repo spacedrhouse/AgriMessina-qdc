@@ -112,6 +112,7 @@ def build_operazione_payload(engine_or_conn,
 
 
 def _esegui_build_operazione(conn, local_ids: list[int]) -> dict | None:
+    import uuid as _uuid
     trattamenti = []
     for tid in local_ids:
         # `include_is_autorizzato=False` perché lato POST /operazioni il flag
@@ -123,7 +124,13 @@ def _esegui_build_operazione(conn, local_ids: list[int]) -> dict | None:
     if not trattamenti:
         return None
     return {
-        # operazione_id non incluso: server alloca il proprio progressivo.
-        "operazione": {"trattamenti": trattamenti},
+        "operazione": {
+            # idempotency_key: UUID generato qui una volta sola. Se la POST
+            # raggiunge il server ma la response si perde (timeout di rete),
+            # al prossimo retry il server riconosce la chiave e ritorna
+            # l'operazione_id già allocato invece di duplicare la creazione.
+            "idempotency_key": str(_uuid.uuid4()),
+            "trattamenti": trattamenti,
+        },
         "local_ids": list(local_ids),
     }

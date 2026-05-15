@@ -343,7 +343,21 @@ class DialogCompensaDisavanzo(QDialog):
         if n == 0:
             return [], qta_da_scaricare, []
 
-        qta_min_etichetta = (self.min_s * self.src_ettari) if self.min_s > 0 else 0.0
+        # qta minima da preservare sul tendone origine = min etichetta × volume.
+        # BUG FIX: la versione precedente usava sempre `min_s * src_ettari`
+        # ignorando l'unità di misura. Per prodotti `/hl` il volume corretto
+        # è `botti × 10` (acqua applicata), non gli ettari. Usare il fallback
+        # ettari quando le botti non sono registrate. Stessa formula di
+        # `_carica_target` (q_min = min × volume_acqua), per coerenza fra
+        # calcolo dello spazio rimovibile e distribuzione dello scarico.
+        if self.min_s > 0:
+            if '/hl' in self.um:
+                volume = (self.src_botti_tot if self.src_botti_tot > 0 else self.src_ettari) * 10.0
+            else:
+                volume = self.src_ettari
+            qta_min_etichetta = self.min_s * volume
+        else:
+            qta_min_etichetta = 0.0
 
         spazi = []
         for r in righe_origine:

@@ -632,6 +632,13 @@ class PannelloProdotti(PannelloBaseDialog):
         self.btn_export_tutti_mov.setProperty('class', 'success')
         self.btn_export_tutti_mov.clicked.connect(self._esporta_tutti_movimenti)
 
+        # Esporta giacenze: snapshot prodotto-per-prodotto con SUM(CARICO) -
+        # SUM(SCARICO). Rispetta il filtro azienda e il toggle reale/fittizio
+        # selezionato. Utile per inventario fisico / verifiche etichetta.
+        self.btn_export_giacenze = QPushButton("📦 Esporta Giacenze")
+        self.btn_export_giacenze.setProperty('class', 'success')
+        self.btn_export_giacenze.clicked.connect(self._esporta_giacenze)
+
         # Toggle reale ↔ fittizio. Classe `secondary` (blu): nel QSS globale
         # esistono solo success/warning/danger/secondary; "primary" non c'è e
         # ricadeva nel default Qt fuori standard.
@@ -641,7 +648,8 @@ class PannelloProdotti(PannelloBaseDialog):
 
         top_layout = self.layout().itemAt(0).layout()
         top_layout.insertWidget(4, self.btn_export_tutti_mov)
-        top_layout.insertWidget(5, self.btn_toggle_fittizio)
+        top_layout.insertWidget(5, self.btn_export_giacenze)
+        top_layout.insertWidget(6, self.btn_toggle_fittizio)
 
         self.vista.doubleClicked.connect(self._on_doppio_click)
         self.aggiorna_dati()
@@ -716,11 +724,17 @@ class PannelloProdotti(PannelloBaseDialog):
         self.vista.resizeColumnsToContents()
 
     def _esporta_tutti_movimenti(self):
-        # Nome file di default include il magazzino, se filtrato
-        default_name = (
-            f"Movimenti_{self.azienda_filter.replace(' ', '_')}.xlsx"
-            if self.azienda_filter else "Movimenti_Magazzino.xlsx"
-        )
+        # Nome file di default include il magazzino, se filtrato.
+        # Sanitizziamo i caratteri illegali su Windows (\/:*?"<>|) sostituendoli
+        # con underscore. Senza, un'azienda nominata "Messina: Alfio" rendeva
+        # il dialogo di salvataggio fallimentare oppure salvava un file con
+        # nome corrotto in modo confuso per l'utente.
+        import re
+        if self.azienda_filter:
+            safe_name = re.sub(r'[\\/:*?"<>|]', '_', self.azienda_filter).replace(' ', '_')
+            default_name = f"Movimenti_{safe_name}.xlsx"
+        else:
+            default_name = "Movimenti_Magazzino.xlsx"
         f_p, _ = QFileDialog.getSaveFileName(self, "Esporta Movimenti", default_name, "Excel (*.xlsx)")
         if not f_p:
             return
@@ -833,8 +847,158 @@ class PannelloProdotti(PannelloBaseDialog):
             QMessageBox.information(self, "Esportazione", f"File Excel salvato correttamente:\n{f_p}")
         except ImportError:
             QMessageBox.critical(self, "Errore", "Per esportare in Excel servono le librerie pandas e openpyxl.\nInstallale con: pip install pandas openpyxl")
+        except PermissionError:
+            # Caso comune: l'utente ha già aperto il file in Excel/LibreOffice.
+            # Senza handle dedicato, l'errore generico era misterioso.
+            QMessageBox.critical(
+                self, "File in uso",
+                f"Impossibile scrivere il file:\n{f_p}\n\n"
+                "È aperto in Excel o LibreOffice. Chiudilo e riprova.",
+            )
         except Exception as e:
             log.exception("Esportazione movimenti Excel fallita")
+            QMessageBox.critical(self, "Errore", f"Esportazione fallita:\n{str(e)}")
+
+    def _esporta_giacenze(self):
+        """Esporta in Excel la giacenza prodotto-per-prodotto.
+
+        Rispetta:
+        - Filtro azienda (`azienda_ids`): include solo i magazzini selezionati
+          + i loro alias (vedi `_resolve_filter_ids`).
+        - Toggle reale/fittizio (`mostra_fittizio`): legge dalla tabella
+          corrente, così l'utente esporta lo snapshot che sta guardando.
+        - Prodotti in blacklist sono inclusi con flag dedicato per coerenza
+          con la vista (non esclusi: l'utente potrebbe averne in giacenza
+          da prima della messa in blacklist).
+        """
+        import re
+        from datetime import datetime
+
+        suffisso = "_fittizio" if self.mostra_fittizio else ""
+        if self.azienda_filter:
+            safe_name = re.sub(r'[\\/:*?"<>|]', '_', self.azienda_filter).replace(' ', '_')
+            default_name = f"Giacenze_{safe_name}{suffisso}_{datetime.now():%Y-%m-%d}.xlsx"
+        else:
+            default_name = f"Giacenze_Magazzino{suffisso}_{datetime.now():%Y-%m-%d}.xlsx"
+
+        f_p, _ = QFileDialog.getSaveFileName(self, "Esporta Giacenze", default_name, "Excel (*.xlsx)")
+        if not f_p:
+            return
+        if not f_p.lower().endswith('.xlsx'):
+            f_p += '.xlsx'
+
+        tabella = self._tabella()
+        clausola_az = self._where_azienda_clause("rm")
+
+        try:
+            import pandas as pd
+
+            with self.engine.connect() as conn:
+                # Stesso calcolo di `aggiorna_dati`: SUM(CARICO) - SUM(SCARICO)
+                # per prodotto. Aggiungiamo anche conteggi N. movimenti +
+                # ultimo movimento (data) per dare contesto all'inventario.
+                # Lasciato fuori `qta_acqua` / `titolo_n,p,k` che servono solo
+                # alla UI per i dettagli prodotto.
+                query = text(f"""
+                    SELECT
+                        p.nome_prodotto AS "Prodotto",
+                        p.unita_misura AS "Unità Misura",
+                        ROUND(COALESCE((
+                            SELECT SUM(CASE WHEN rm.tipo_movimento = 'CARICO'
+                                       THEN rm.quantita ELSE -rm.quantita END)
+                            FROM {tabella} rm
+                            WHERE rm.prodotto_id = p.id {clausola_az}
+                        ), 0), 4) AS "Giacenza",
+                        (SELECT COUNT(*) FROM {tabella} rm
+                          WHERE rm.prodotto_id = p.id {clausola_az}) AS "N. Movimenti",
+                        (SELECT MAX(rm.data_movimento) FROM {tabella} rm
+                          WHERE rm.prodotto_id = p.id {clausola_az}) AS "Ultimo Movimento",
+                        p.categoria AS "Categoria",
+                        p.numero_registrazione AS "N. Registrazione",
+                        p.sostanza_attiva AS "Sostanza Attiva",
+                        p.bio_convenzionale AS "Bio/Conv",
+                        CASE WHEN LOWER(TRIM(COALESCE(p.blacklist,''))) = 'si'
+                             THEN 'BLACKLIST' ELSE '' END AS "Blacklist",
+                        p.avversita AS "Avversità",
+                        p.phi_giorni AS "PHI (giorni)",
+                        p.trattamenti_max AS "Max Trattamenti",
+                        p.intervallo_min_tratt AS "Intervallo Min (gg)",
+                        p.min_sostanza AS "Min Etichetta",
+                        p.max_sostanza AS "Max Etichetta"
+                    FROM prodotti p
+                    ORDER BY p.nome_prodotto
+                """)
+                df = pd.read_sql(query, conn)
+
+            if df.empty:
+                QMessageBox.information(self, "Nessun dato",
+                                        "Nessun prodotto in anagrafica.")
+                return
+
+            with pd.ExcelWriter(f_p, engine='openpyxl') as writer:
+                # Sheet name include il magazzino se filtrato — utile quando
+                # l'utente esporta più magazzini e poi li accorpa in un solo workbook.
+                sheet_name = (self.azienda_filter or "Magazzino")[:31]  # 31 = limite Excel
+                df.to_excel(writer, sheet_name=sheet_name, index=False)
+
+                ws = writer.sheets[sheet_name]
+                from openpyxl.styles import Font, PatternFill, Alignment
+
+                # Header verde brand
+                header_font = Font(bold=True, color="FFFFFF")
+                header_fill = PatternFill(start_color="2E7D32", end_color="2E7D32", fill_type="solid")
+                header_align = Alignment(horizontal="center", vertical="center", wrap_text=True)
+                for cell in ws[1]:
+                    cell.font = header_font
+                    cell.fill = header_fill
+                    cell.alignment = header_align
+
+                # Evidenzia righe blacklist (rosso chiaro), giacenza negativa
+                # (rosso più scuro) e righe a zero (grigio chiaro).
+                fill_blacklist = PatternFill(start_color="FFCDD2", end_color="FFCDD2", fill_type="solid")
+                fill_negativa = PatternFill(start_color="EF9A9A", end_color="EF9A9A", fill_type="solid")
+                fill_zero = PatternFill(start_color="F5F5F5", end_color="F5F5F5", fill_type="solid")
+                col_giacenza = df.columns.get_loc("Giacenza") + 1
+                col_blacklist = df.columns.get_loc("Blacklist") + 1
+                for row_idx in range(2, ws.max_row + 1):
+                    bl = ws.cell(row=row_idx, column=col_blacklist).value
+                    gi = ws.cell(row=row_idx, column=col_giacenza).value
+                    fill = None
+                    if bl == "BLACKLIST":
+                        fill = fill_blacklist
+                    elif isinstance(gi, (int, float)) and gi < 0:
+                        fill = fill_negativa
+                    elif isinstance(gi, (int, float)) and gi == 0:
+                        fill = fill_zero
+                    if fill:
+                        for col_idx in range(1, len(df.columns) + 1):
+                            ws.cell(row=row_idx, column=col_idx).fill = fill
+
+                # Auto-fit colonne (con clamp).
+                for col_idx, column in enumerate(ws.columns, start=1):
+                    max_length = max(
+                        (len(str(cell.value)) for cell in column if cell.value is not None),
+                        default=10,
+                    )
+                    col_letter = ws.cell(row=1, column=col_idx).column_letter
+                    ws.column_dimensions[col_letter].width = min(max_length + 2, 35)
+                ws.row_dimensions[1].height = 30
+                ws.freeze_panes = "A2"
+
+            QMessageBox.information(self, "Esportazione",
+                                    f"File Excel salvato correttamente:\n{f_p}")
+        except ImportError:
+            QMessageBox.critical(self, "Errore",
+                                 "Per esportare in Excel servono le librerie pandas e openpyxl.\n"
+                                 "Installale con: pip install pandas openpyxl")
+        except PermissionError:
+            QMessageBox.critical(
+                self, "File in uso",
+                f"Impossibile scrivere il file:\n{f_p}\n\n"
+                "È aperto in Excel o LibreOffice. Chiudilo e riprova.",
+            )
+        except Exception as e:
+            log.exception("Esportazione giacenze Excel fallita")
             QMessageBox.critical(self, "Errore", f"Esportazione fallita:\n{str(e)}")
 
     def _on_doppio_click(self, index):

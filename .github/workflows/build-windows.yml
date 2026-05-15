@@ -76,8 +76,13 @@ jobs:
           RELEASE_READ_PAT: ${{ secrets.RELEASE_READ_PAT }}
         run: |
           if [[ -n "$RELEASE_READ_PAT" ]]; then
+            # ::add-mask:: chiede a GitHub Actions di nascondere il valore
+            # nei log dei step successivi (es. se PyInstaller dovesse stampare
+            # qualcosa che lo contiene). Stampato prima di qualsiasi altro
+            # comando che possa toccare il token.
+            echo "::add-mask::$RELEASE_READ_PAT"
             echo "GITHUB_TOKEN = \"$RELEASE_READ_PAT\"" > _secrets.py
-            echo "_secrets.py creato (token iniettato)."
+            echo "_secrets.py creato (token iniettato e mascherato nei log)."
           else
             echo "GITHUB_TOKEN = None" > _secrets.py
             echo "RELEASE_READ_PAT non configurato — auto-update funzionerà solo se il repo è pubblico."

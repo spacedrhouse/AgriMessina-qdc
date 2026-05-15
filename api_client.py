@@ -314,10 +314,17 @@ class ApiClient:
     def get_trattamento(self, id: int) -> Dict[str, Any]:
         return self._request("GET", f"/trattamenti/{id}")
 
-    def quick_get_trattamento(self, id: int, timeout: float = 3.0) -> Dict[str, Any]:
+    def quick_get_trattamento(self, id: int, timeout: Optional[float] = None) -> Dict[str, Any]:
         """GET con timeout corto: usato per pre-check pre-azione (modifica,
         revisiona, elimina). Se la rete è giù vogliamo fallire subito invece
-        di bloccare la UI sul timeout default di 20s."""
+        di bloccare la UI sul timeout default di 20s.
+
+        Default da `CONFIG.quick_get_timeout_s` (env `QDC_QUICK_GET_TIMEOUT_S`):
+        prima era hardcoded 3.0 e l'env-var veniva ignorata, frustrante per
+        utenti su connessioni lente che non potevano allungare."""
+        if timeout is None:
+            from config import CONFIG
+            timeout = CONFIG.quick_get_timeout_s
         try:
             resp = self._client.request(
                 "GET", f"/trattamenti/{id}",
@@ -421,12 +428,15 @@ class ApiClient:
 
     # ---- HEALTH -------------------------------------------------------------
 
-    def health(self, timeout: float = 3.0) -> Dict[str, Any]:
+    def health(self, timeout: Optional[float] = None) -> Dict[str, Any]:
         """Pinga il backend. Usato allo startup per capire se siamo online.
 
-        Timeout breve (3s default) per non bloccare lo splash se il server è
-        lento/down. Bypassa il timeout di default di self._client (20s).
-        """
+        Timeout breve (default da `CONFIG.quick_get_timeout_s`, 3s di base)
+        per non bloccare lo splash se il server è lento/down. Bypassa il
+        timeout di default di self._client (20s)."""
+        if timeout is None:
+            from config import CONFIG
+            timeout = CONFIG.quick_get_timeout_s
         try:
             resp = self._client.get("/health", headers=self._headers(), timeout=timeout)
         except (httpx.ConnectError, httpx.ConnectTimeout, httpx.ReadTimeout) as e:
