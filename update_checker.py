@@ -16,6 +16,7 @@ Politica:
 from __future__ import annotations
 
 import logging
+import os
 import re
 from dataclasses import dataclass
 from typing import Optional
@@ -25,8 +26,8 @@ from PyQt6.QtCore import QObject, QThread, pyqtSignal
 
 log = logging.getLogger(__name__)
 
-# Repo da interrogare. Hardcoded ma in chiaro: gli unici "secret" sarebbero
-# il PAT per repo privati, e nel nostro caso il repo è pubblico.
+# Repo da interrogare. Hardcoded in chiaro: il "valore" da proteggere è il
+# token di accesso, non il nome del repo.
 GITHUB_REPO = "spacedrhouse/AgriMessina-qdc"
 GITHUB_API_URL = f"https://api.github.com/repos/{GITHUB_REPO}/releases/latest"
 
@@ -35,10 +36,41 @@ GITHUB_API_URL = f"https://api.github.com/repos/{GITHUB_REPO}/releases/latest"
 HTTP_TIMEOUT_SECONDS = 5.0
 
 
+def _load_github_token() -> Optional[str]:
+    """Ritorna il PAT GitHub se disponibile, altrimenti None.
+
+    Sorgenti in ordine di precedenza:
+      1. `_secrets.py` (iniettato dal workflow CI a build-time, gitignored).
+      2. variabile d'ambiente `AGRIMESSINA_GH_TOKEN` (utile in dev).
+
+    Per repo PUBBLICI il token non serve e le chiamate restano anonime.
+    Per repo PRIVATI il token è obbligatorio: senza, GitHub risponde 404
+    alle GET di `/releases/latest` e dei singoli asset, e l'auto-update
+    tace (vedi `UpdateCheckWorker.run`).
+    """
+    try:
+        from _secrets import GITHUB_TOKEN  # type: ignore[import-not-found]
+        if GITHUB_TOKEN:
+            return GITHUB_TOKEN.strip()
+    except ImportError:
+        pass
+    env = os.environ.get("AGRIMESSINA_GH_TOKEN")
+    return env.strip() if env else None
+
+
+def _api_headers() -> dict[str, str]:
+    """Headers comuni per le chiamate GitHub API. Auth solo se PAT presente."""
+    headers = {"Accept": "application/vnd.github+json"}
+    token = _load_github_token()
+    if token:
+        headers["Authorization"] = f"Bearer {token}"
+    return headers
+
+
 @dataclass
 class UpdateInfo:
     latest_version: str
-    download_url: str       # URL diretto dell'installer .exe
+    download_url: str       # URL diretto dell'installer .exe (asset endpoint)
     release_url: str        # URL della pagina release (fallback se asset assente)
     release_notes: str      # Body markdown della release
 
@@ -83,8 +115,11 @@ class UpdateCheckWorker(QThread):
 
     def run(self) -> None:
         try:
-            resp = httpx.get(GITHUB_API_URL, timeout=HTTP_TIMEOUT_SECONDS,
-                             headers={"Accept": "application/vnd.github+json"})
+            resp = httpx.get(
+                GITHUB_API_URL,
+                timeout=HTTP_TIMEOUT_SECONDS,
+                headers=_api_headers(),
+            )
             if resp.status_code != 200:
                 log.debug("[update_check] status %d, skip", resp.status_code)
                 return
@@ -102,12 +137,20 @@ class UpdateCheckWorker(QThread):
                      self.current_version, latest)
             return
 
-        # Cerca l'asset .exe (l'installer Inno Setup).
+        # Cerca l'asset .exe (l'installer Inno Setup). Per repo privati il
+        # `browser_download_url` da solo non basta (richiede comunque auth);
+        # usiamo invece l'endpoint API per asset_id che funziona sia in
+        # pubblico (redirect a CDN) sia in privato (auth header + redirect a
+        # signed URL S3, dove httpx striperà l'Authorization su cross-origin).
         download_url = ""
         for asset in data.get("assets") or []:
             name = str(asset.get("name") or "")
-            if name.lower().endswith(".exe"):
-                download_url = str(asset.get("browser_download_url") or "")
+            asset_id = asset.get("id")
+            if asset_id and name.lower().endswith(".exe"):
+                download_url = (
+                    f"https://api.github.com/repos/{GITHUB_REPO}"
+                    f"/releases/assets/{asset_id}"
+                )
                 break
 
         info = UpdateInfo(

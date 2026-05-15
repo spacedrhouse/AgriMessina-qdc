@@ -48,3 +48,8 @@ Trattamenti_Revisionati.xlsx
 
 # --- Legacy / dipendenze native non più necessarie ---
 libmariadb.dll
+
+# --- Secret iniettato a build-time (token GitHub per auto-update privato) ---
+# Generato dal workflow CI da `secrets.RELEASE_READ_PAT`; in dev, opzionale,
+# crealo a mano se vuoi testare l'auto-update localmente. MAI committare.
+_secrets.py

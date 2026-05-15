@@ -26,6 +26,8 @@ from pathlib import Path
 import httpx
 from PyQt6.QtCore import QObject, QThread, pyqtSignal
 
+from update_checker import _load_github_token
+
 log = logging.getLogger(__name__)
 
 # Timeout di download: il file installer è ~50-100MB, su connessioni lente
@@ -61,12 +63,23 @@ class UpdateDownloadWorker(QThread):
         # Nome file deterministico in temp: se l'utente fa "Aggiorna" più volte
         # nello stesso boot, riusiamo lo stesso path invece di accumulare .exe.
         dest = Path(tempfile.gettempdir()) / "AgriMessina_Update.exe"
+
+        # Per repo PRIVATE l'URL punta a `api.github.com/.../releases/assets/{id}`
+        # e va col header Authorization. GitHub risponde con un 302 verso una
+        # signed URL S3: httpx (default) striperà l'Authorization sul redirect
+        # cross-origin, quindi S3 vede solo i propri parametri di firma —
+        # comportamento corretto, sia per repo pubblici sia privati.
+        headers = {"Accept": "application/octet-stream"}
+        token = _load_github_token()
+        if token:
+            headers["Authorization"] = f"Bearer {token}"
+
         try:
             with httpx.stream(
                 "GET", self._url,
                 follow_redirects=True,
                 timeout=DOWNLOAD_TIMEOUT_SECONDS,
-                headers={"Accept": "application/octet-stream"},
+                headers=headers,
             ) as resp:
                 if resp.status_code != 200:
                     self.failed.emit(f"HTTP {resp.status_code} su GET installer")

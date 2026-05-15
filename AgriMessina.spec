@@ -31,6 +31,7 @@ hiddenimports = [
     'openpyxl.cell._writer',
     'reportlab',        # import lazy in _scrivi_pdf
     '_version',         # generato da CI, contiene __version__ per l'update checker
+    '_secrets',         # generato da CI, contiene GITHUB_TOKEN per auto-update repo privato
     'backup_manager',   # import lazy in main.run()
     'migrations',       # import lazy in main.run()
     'crash_reporter',   # import lazy in main.run()

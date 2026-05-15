@@ -62,6 +62,27 @@ jobs:
           echo "Contenuto _version.py:"
           cat _version.py
 
+      - name: Iniezione token GitHub in _secrets.py (auto-update repo privato)
+        # Senza, l'auto-update non vedrebbe le release del repo privato
+        # (le chiamate GitHub API anonime ritornano 404). Il file _secrets.py
+        # è gitignored: vive SOLO nei build CI, mai nel sorgente.
+        # Il segreto `RELEASE_READ_PAT` va creato nelle impostazioni del repo
+        # come Fine-grained PAT con scope `Contents: Read-only` su questo repo.
+        # Se il segreto non è impostato (es. fork pubblico, dev), il file
+        # creato qui è vuoto: l'app userà chiamate anonime (fallisce per
+        # repo privati — il flow degrada silenzioso).
+        shell: bash
+        env:
+          RELEASE_READ_PAT: ${{ secrets.RELEASE_READ_PAT }}
+        run: |
+          if [[ -n "$RELEASE_READ_PAT" ]]; then
+            echo "GITHUB_TOKEN = \"$RELEASE_READ_PAT\"" > _secrets.py
+            echo "_secrets.py creato (token iniettato)."
+          else
+            echo "GITHUB_TOKEN = None" > _secrets.py
+            echo "RELEASE_READ_PAT non configurato — auto-update funzionerà solo se il repo è pubblico."
+          fi
+
       - name: Build con PyInstaller (--onedir)
         run: pyinstaller AgriMessina.spec --noconfirm --clean
 
