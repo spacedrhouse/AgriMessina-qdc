@@ -88,30 +88,46 @@ def _normalize_version(v: str) -> tuple[int, ...]:
     return tuple(parts) if parts else (0,)
 
 
-def _is_newer(latest: str, current: str) -> bool:
+def _is_newer(latest: str, current: str, force_dev: bool = False) -> bool:
     """True se `latest` è una versione successiva rispetto a `current`.
 
     Trattamento speciale: se current è '0.0.0-dev' (sviluppo locale) NON
-    siamo interessati agli update — stiamo già lavorando alla prossima
-    versione probabilmente.
+    siamo interessati agli update automatici — stiamo già lavorando alla
+    prossima versione probabilmente.
+
+    `force_dev=True` (passato dal check manuale): l'utente ha cliccato
+    esplicitamente "Verifica aggiornamenti", quindi vogliamo dirgli cosa
+    c'è sul server anche in dev — utile per testare il flusso.
     """
-    if current.endswith("-dev") or current == "0.0.0":
+    if not force_dev and (current.endswith("-dev") or current == "0.0.0"):
         return False
     return _normalize_version(latest) > _normalize_version(current)
 
 
 class UpdateCheckWorker(QThread):
     """QThread one-shot che fa il check e emette `update_available` solo se
-    c'è davvero qualcosa di nuovo. Niente segnali in caso di errore: silenzio
-    è la politica corretta (non vogliamo popup "errore aggiornamento" che
-    annoiano l'utente).
+    c'è davvero qualcosa di nuovo.
+
+    Doppia modalità:
+      - **automatic** (default): silenzio se non c'è update / errore di rete.
+        Politica "polite" per l'avvio dell'app — non disturbare l'utente.
+      - **manual**: l'utente ha cliccato "Verifica aggiornamenti". Anche
+        "sei già aggiornato" o "rete giù" sono risposte legittime, e
+        emettiamo segnali dedicati così la UI può mostrare feedback.
+
+    Il chiamante imposta `manual=True` solo dal handler del bottone.
     """
 
     update_available = pyqtSignal(object)  # UpdateInfo
+    # Emessi solo in modalità manuale (verifica esplicita dell'utente).
+    up_to_date = pyqtSignal(str)           # versione corrente
+    check_failed = pyqtSignal(str)         # messaggio errore breve
 
-    def __init__(self, current_version: str, parent: Optional[QObject] = None) -> None:
+    def __init__(self, current_version: str, parent: Optional[QObject] = None,
+                 manual: bool = False) -> None:
         super().__init__(parent)
         self.current_version = current_version
+        self.manual = manual
 
     def run(self) -> None:
         try:
@@ -122,19 +138,33 @@ class UpdateCheckWorker(QThread):
             )
             if resp.status_code != 200:
                 log.debug("[update_check] status %d, skip", resp.status_code)
+                if self.manual:
+                    self.check_failed.emit(
+                        f"Il server ha risposto con HTTP {resp.status_code}."
+                    )
                 return
             data = resp.json()
         except Exception as e:
             log.debug("[update_check] errore rete: %s", e)
+            if self.manual:
+                self.check_failed.emit(
+                    "Impossibile contattare GitHub. Verifica la connessione."
+                )
             return
 
         latest = str(data.get("tag_name") or "").strip()
         if not latest:
+            if self.manual:
+                self.check_failed.emit("Risposta da GitHub senza tag_name.")
             return
 
-        if not _is_newer(latest, self.current_version):
+        # Nel check manuale, l'utente sta verificando esplicitamente: bypass
+        # del "salta tutto se sei in -dev" per testare il flusso reale.
+        if not _is_newer(latest, self.current_version, force_dev=self.manual):
             log.info("[update_check] versione corrente %s ≥ latest %s, niente update",
                      self.current_version, latest)
+            if self.manual:
+                self.up_to_date.emit(self.current_version)
             return
 
         # Cerca l'asset .exe (l'installer Inno Setup). Per repo privati il

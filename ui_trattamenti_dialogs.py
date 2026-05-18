@@ -1861,7 +1861,8 @@ class DialogStoricoProdottiTendone(QDialog):
                         ELSE SUM(CASE WHEN (p.intervallo_min_tratt IS NULL OR p.intervallo_min_tratt <= 0
                                              OR julianday('now') - julianday(t.data_trattamento) <= p.intervallo_min_tratt)
                                       THEN dt.quantita_sostanza ELSE 0 END) / :ettari
-                    END, 1) as d_cum,
+                    END, 4) as d_cum,  -- 4 decimali per coerenza con "Qta Totale"
+                                       -- (era 1, mostrava 0.7 invece di 0.6898).
 
                     0, MAX(t.data_trattamento), p.min_sostanza, p.max_sostanza,
                     COALESCE(SUM(CASE WHEN (p.intervallo_min_tratt IS NULL OR p.intervallo_min_tratt <= 0

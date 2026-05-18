@@ -296,9 +296,12 @@ class FinestraPrincipale(QMainWindow):
             lbl_logo.setStyleSheet("background: transparent; padding: 20px 10px;")
             lside.addWidget(lbl_logo)
 
+        # Sidebar in due blocchi: principale in alto, "Storico" isolato in
+        # fondo (analogo al pattern Impostazioni/Logout di molte UI). Lo
+        # storico è di sola consultazione: separarlo evita che l'utente lo
+        # confonda col workflow corrente (Revisionati).
         self.btn_group = []
-        menu = [
-            ("📊 Storico", 0),
+        menu_principale = [
             ("✅ Revisionati", 1),
             ("📦 Mag. Agrimessina", 2),
             ("📦 Mag. La Gazzella", 3),
@@ -308,7 +311,11 @@ class FinestraPrincipale(QMainWindow):
             ("🌍 Agri", 7),
             ("🏢 Aziende", 8),
         ]
-        for testo, idx in menu:
+        menu_fondo = [
+            ("📊 Storico", 0),
+        ]
+
+        def _aggiungi_bottone(testo: str, idx: int) -> None:
             b = QPushButton(testo)
             b.setCheckable(True)
             b.setAutoExclusive(True)
@@ -316,7 +323,25 @@ class FinestraPrincipale(QMainWindow):
             lside.addWidget(b)
             self.btn_group.append(b)
 
+        for testo, idx in menu_principale:
+            _aggiungi_bottone(testo, idx)
+
+        # Stretch in mezzo: spinge il blocco "fondo" verso il basso della sidebar.
         lside.addStretch()
+
+        for testo, idx in menu_fondo:
+            _aggiungi_bottone(testo, idx)
+
+        # Bottone "Verifica aggiornamenti": NON è una pagina della
+        # QStackedWidget, è un'azione one-shot. Non checkable, non aggiunto
+        # a btn_group (l'auto-exclusive group lo escluderebbe dal toggle dei
+        # pulsanti pagina). Riusa lo stesso flusso dell'auto-check ma in
+        # modalità manuale → l'utente riceve feedback anche se è già
+        # aggiornato o se la rete è down.
+        self.btn_check_update = QPushButton("🔄 Verifica aggiornamenti")
+        self.btn_check_update.clicked.connect(self._verifica_aggiornamenti_manuale)
+        lside.addWidget(self.btn_check_update)
+
         body_layout.addWidget(sidebar)
 
         # Pagine
@@ -920,6 +945,60 @@ class FinestraPrincipale(QMainWindow):
         # 4000 ms = durata default del toast su Windows/Linux. Su macOS
         # è ignorato (li gestisce il Notification Center).
         self.tray.showMessage(title, body, QSystemTrayIcon.MessageIcon.Information, 4000)
+
+    def _verifica_aggiornamenti_manuale(self):
+        """Check on-demand attivato dal bottone "Verifica aggiornamenti".
+
+        Differenze rispetto al check automatico al boot:
+          - L'utente ottiene feedback ANCHE se l'app è già aggiornata.
+          - L'utente ottiene feedback ANCHE se il check fallisce (rete giù).
+        Senza, il click sul bottone sembrerebbe non fare nulla.
+        Il bottone viene disabilitato durante il check per evitare double-click.
+        """
+        # Reentrancy guard: se l'utente clicca due volte di fila, ignora il
+        # secondo click finché il primo worker non ha finito.
+        existing = getattr(self, "_manual_update_worker", None)
+        if existing is not None and existing.isRunning():
+            return
+
+        self.btn_check_update.setEnabled(False)
+        self.btn_check_update.setText("🔄 Verifico...")
+
+        worker = UpdateCheckWorker(APP_VERSION, parent=self, manual=True)
+        self._manual_update_worker = worker
+
+        def _ripristina_bottone():
+            self.btn_check_update.setEnabled(True)
+            self.btn_check_update.setText("🔄 Verifica aggiornamenti")
+
+        def _on_available(info: UpdateInfo):
+            _ripristina_bottone()
+            # Riusa lo stesso popup dell'auto-check: l'utente vede le note di
+            # rilascio e può cliccare "Aggiorna e riavvia".
+            self._on_update_available(info)
+
+        def _on_up_to_date(_v: str):
+            _ripristina_bottone()
+            QMessageBox.information(
+                self, "Nessun aggiornamento",
+                f"AgriMessina QDC <b>{APP_VERSION}</b> è già la versione più recente.",
+            )
+
+        def _on_failed(msg: str):
+            _ripristina_bottone()
+            QMessageBox.warning(
+                self, "Verifica fallita",
+                f"Non è stato possibile controllare gli aggiornamenti.\n\n{msg}",
+            )
+
+        worker.update_available.connect(_on_available)
+        worker.up_to_date.connect(_on_up_to_date)
+        worker.check_failed.connect(_on_failed)
+        # finished è un signal built-in di QThread; lo usiamo come safety net
+        # per ripristinare il bottone anche se nessun signal di esito viene
+        # emesso (improbabile, ma evita stato bloccato in caso patologico).
+        worker.finished.connect(_ripristina_bottone)
+        worker.start()
 
     def _on_update_available(self, info: UpdateInfo):
         """Notifica all'utente che c'è una versione più recente disponibile.

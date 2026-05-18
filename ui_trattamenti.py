@@ -1257,6 +1257,7 @@ class SchedaOperazioni(QWidget):
 
                 query = text(f"""
                     SELECT
+                        t.id AS "id_trattamento",
                         a.aziende AS "Azienda",
                         a.agri AS "Agro",
                         a.contrade AS "Contrada",
@@ -1383,8 +1384,9 @@ class SchedaOperazioni(QWidget):
                 )
 
                 colonne_ordinate = [
+                    "id_trattamento", "id_operazione",
                     "Azienda", "Agro", "Contrada", "Tendoni", "Ettari Totali",
-                    "Data", "id_operazione", "Prodotto", "N. Registrazione", "Sostanza Attiva",
+                    "Data", "Prodotto", "N. Registrazione", "Sostanza Attiva",
                     "Avversità", "PHI (giorni)", "Primo giorno utile raccolta",
                     "Unità Misura", "Dose", "N. Botti", "Q.tà Acqua (litri)",
                     "Q.tà Totale Prodotto", "Operatore"
