@@ -297,12 +297,20 @@ class FinestraPrincipale(QMainWindow):
             lside.addWidget(lbl_logo)
 
         # Sidebar in due blocchi: principale in alto, "Storico" isolato in
-        # fondo (analogo al pattern Impostazioni/Logout di molte UI). Lo
-        # storico è di sola consultazione: separarlo evita che l'utente lo
-        # confonda col workflow corrente (Revisionati).
+        # fondo (pattern Impostazioni/Logout). Lo Storico è di sola
+        # consultazione, separato dal workflow corrente.
+        #
+        # Per gli utenti BASIC:
+        #  - "Storico" non viene mostrato affatto (skippato dal menu_fondo).
+        #  - "Revisionati" è rinominato "Trattamenti": termine più semplice
+        #    per chi non sa cosa significa "revisionato".
+        # Tutto silenzioso: niente warning, niente click che bloccano.
+        is_admin = self.api.is_admin
+        label_trattamenti = "✅ Revisionati" if is_admin else "🧪 Trattamenti"
+
         self.btn_group = []
         menu_principale = [
-            ("✅ Revisionati", 1),
+            (label_trattamenti, 1),
             ("📦 Mag. Agrimessina", 2),
             ("📦 Mag. La Gazzella", 3),
             ("📦 Mag. Messina Alfio", 4),
@@ -311,9 +319,7 @@ class FinestraPrincipale(QMainWindow):
             ("🌍 Agri", 7),
             ("🏢 Aziende", 8),
         ]
-        menu_fondo = [
-            ("📊 Storico", 0),
-        ]
+        menu_fondo = [("📊 Storico", 0)] if is_admin else []
 
         def _aggiungi_bottone(testo: str, idx: int) -> None:
             b = QPushButton(testo)
@@ -359,7 +365,11 @@ class FinestraPrincipale(QMainWindow):
         self.pagine.addWidget(PannelloAziende(self.engine, self.db))
         body_layout.addWidget(self.pagine)
 
+        # Pagina iniziale = Revisionati/Trattamenti (idx 1), che è il primo
+        # bottone nel btn_group (sia per ADMIN sia per BASIC, dopo il
+        # riordino della sidebar).
         self.btn_group[0].setChecked(True)
+        self.pagine.setCurrentIndex(1)
         self.setStyleSheet(STYLE_AGRIMESSINA)
 
     def _toggle_maximize(self):

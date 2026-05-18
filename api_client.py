@@ -385,6 +385,14 @@ class ApiClient:
         resp = self._request("GET", "/utenti")
         return resp if isinstance(resp, list) else []
 
+    def create_utente(self, dto: Dict[str, Any]) -> Dict[str, Any]:
+        """POST /utenti — crea un nuovo utente. Richiede ruolo ADMIN.
+
+        Campi attesi nel dto: username, password, ruolo (opz, default BASIC),
+        email/nome/cognome/data_nascita (tutti opzionali).
+        """
+        return self._request("POST", "/utenti", json_body=dto)
+
     # ---- MAGAZZINO ----------------------------------------------------------
 
     def sync_movimenti(self, since: Optional[str] = None,

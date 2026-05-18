@@ -39,6 +39,33 @@ from magazzino_logic import (
 from trattamenti_payload import build_trattamento_payload as _build_trattamento_payload
 
 
+def _utente_e_admin(widget) -> bool:
+    """Cerca l'ApiClient navigando la catena parent del widget e ritorna
+    True se l'utente loggato è ADMIN.
+
+    Pattern: tutti i dialog vengono aperti con `parent=<SchedaOperazioni|
+    PannelloTendoni|MainWindow>`. Quei widget hanno `.api` (set in __init__),
+    oppure puntano alla MainWindow che lo ha. Senza una soluzione "globale"
+    (es. singleton ApiClient), questa walk-up è la meno invasiva.
+
+    Default sicuro: se non troviamo l'api, ritorniamo False → BASIC →
+    feature ristrette nascoste. Meglio mostrare meno che mostrare a chi
+    non avrebbe diritto.
+    """
+    obj = widget
+    visited = 0
+    while obj is not None and visited < 10:
+        api = getattr(obj, "api", None)
+        if api is not None and hasattr(api, "is_admin"):
+            try:
+                return bool(api.is_admin)
+            except Exception:
+                return False
+        obj = obj.parent() if hasattr(obj, "parent") else None
+        visited += 1
+    return False
+
+
 def _botti_stimate(ettari: float) -> float:
     """Numero di botti previsto per un trattamento futuro su `ettari`.
 
@@ -1812,16 +1839,23 @@ class DialogStoricoProdottiTendone(QDialog):
 
         layout.addWidget(self.tabella)
 
-        btns = QHBoxLayout()
-        btn_compensa = QPushButton("⚖️ Bilancia")
-        btn_undo = QPushButton("↩️ Annulla Ultimo")
-        btn_compensa.setProperty('class', 'warning')
-        btn_undo.setProperty('class', 'danger')
+        # I bottoni di bilanciamento sono ADMIN-only. Per gli utenti BASIC
+        # NON vengono nemmeno aggiunti al layout: niente warning, niente
+        # bottoni grigi che invitano al click. Solo lo storico in lettura.
+        # Cerchiamo il flag di ruolo navigando i parent (l'ApiClient è
+        # sulla MainWindow), così il dialog non deve essere modificato
+        # ovunque viene aperto.
+        if _utente_e_admin(self):
+            btns = QHBoxLayout()
+            btn_compensa = QPushButton("⚖️ Bilancia")
+            btn_undo = QPushButton("↩️ Annulla Ultimo")
+            btn_compensa.setProperty('class', 'warning')
+            btn_undo.setProperty('class', 'danger')
 
-        btn_compensa.clicked.connect(self._apri_compensazione)
-        btn_undo.clicked.connect(self._annulla_bilanciamento)
-        btns.addWidget(btn_compensa); btns.addWidget(btn_undo); btns.addStretch()
-        layout.addLayout(btns)
+            btn_compensa.clicked.connect(self._apri_compensazione)
+            btn_undo.clicked.connect(self._annulla_bilanciamento)
+            btns.addWidget(btn_compensa); btns.addWidget(btn_undo); btns.addStretch()
+            layout.addLayout(btns)
         self._carica()
 
     def _carica(self):

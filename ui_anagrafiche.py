@@ -441,27 +441,37 @@ class PannelloTendoni(PannelloBaseDialog):
 
         self.combo_filtro.currentIndexChanged.connect(self.aggiorna_dati)
 
+        # Permessi BASIC: niente accesso alla lista trattamenti per tendone.
+        # Cerchiamo il ruolo sull'ApiClient navigando la catena parent (questo
+        # widget è child della QStackedWidget → MainWindow); lo stesso helper
+        # è usato anche dai dialog di bilanciamento.
+        from ui_trattamenti_dialogs import _utente_e_admin
+        self._is_admin = _utente_e_admin(self)
+
         # --- 2. SETUP PULSANTE LISTA TRATTAMENTI ---
         # Stessa classe blu (`secondary`) usata da Aggiorna/Mostra Fittizio
         # per dimensioni e padding coerenti con gli altri pulsanti toolbar.
         # In passato lo style era inline con padding/border-radius più piccoli
         # e disallineava il pulsante visivamente.
-        self.btn_lista = QPushButton("📋 Lista Trattamenti")
-        self.btn_lista.setProperty('class', 'secondary')
-
-        # Colleghiamo il click alla nuova funzione "interruttore"
-        self.btn_lista.clicked.connect(self._toggle_vista)
-
-        # Inseriamo il pulsante nella barra degli strumenti
-        try:
-            layout_pulsanti = self.layout().itemAt(1).layout()
-            layout_pulsanti.insertWidget(3, self.btn_lista)
-        except AttributeError:
-            pass
+        # Per BASIC il bottone NON viene aggiunto: niente lista trattamenti
+        # per tendone, silent come da policy ruolo.
+        if self._is_admin:
+            self.btn_lista = QPushButton("📋 Lista Trattamenti")
+            self.btn_lista.setProperty('class', 'secondary')
+            self.btn_lista.clicked.connect(self._toggle_vista)
+            try:
+                layout_pulsanti = self.layout().itemAt(1).layout()
+                layout_pulsanti.insertWidget(3, self.btn_lista)
+            except AttributeError:
+                pass
 
         # --- 3. SETUP TABELLA ---
         self.vista.setItemDelegate(DelegateTendoniColorati())
-        self.vista.doubleClicked.connect(self._on_doppio_click)
+        # Doppio click su una riga apre DialogStoricoProdottiTendone (lista
+        # trattamenti per quel tendone). ADMIN-only: per BASIC il signal
+        # non viene mai collegato → click ignorato silent.
+        if self._is_admin:
+            self.vista.doubleClicked.connect(self._on_doppio_click)
 
         # All'avvio popola la tabella con i dati base
         self.aggiorna_dati()
