@@ -1,4 +1,8 @@
+import re
+from datetime import datetime
+
 import pandas as pd
+from openpyxl.styles import Alignment, Font, PatternFill
 from sqlalchemy import text
 from PyQt6.QtWidgets import (QVBoxLayout, QHBoxLayout, QPushButton, QMessageBox,
                              QDialog, QComboBox, QLabel, QLineEdit, QDoubleSpinBox,
@@ -751,7 +755,6 @@ class PannelloProdotti(PannelloBaseDialog):
         # con underscore. Senza, un'azienda nominata "Messina: Alfio" rendeva
         # il dialogo di salvataggio fallimentare oppure salvava un file con
         # nome corrotto in modo confuso per l'utente.
-        import re
         if self.azienda_filter:
             safe_name = re.sub(r'[\\/:*?"<>|]', '_', self.azienda_filter).replace(' ', '_')
             default_name = f"Movimenti_{safe_name}.xlsx"
@@ -805,10 +808,9 @@ class PannelloProdotti(PannelloBaseDialog):
                 return "Carico"
 
             df["Carico/Scarico"] = df["Tipo"].apply(normalizza_tipo)
-            df["Quantità"] = df.apply(
-                lambda r: -abs(r["_qta_raw"]) if r["Carico/Scarico"] == "Scarico" else abs(r["_qta_raw"]),
-                axis=1
-            )
+            # Vettorizzato: 10-50× più veloce di apply(axis=1) per dataset grandi.
+            qta_abs = df["_qta_raw"].abs()
+            df["Quantità"] = qta_abs.where(df["Carico/Scarico"] != "Scarico", -qta_abs)
 
             df["Giacenza"] = (
                 df.groupby(["_azienda_id", "_prodotto_id"])["Quantità"]
@@ -834,7 +836,6 @@ class PannelloProdotti(PannelloBaseDialog):
                 df.to_excel(writer, sheet_name="Movimenti Magazzino", index=False)
 
                 ws = writer.sheets["Movimenti Magazzino"]
-                from openpyxl.styles import Font, PatternFill, Alignment
 
                 header_font = Font(bold=True, color="FFFFFF")
                 header_fill = PatternFill(start_color="2E7D32", end_color="2E7D32", fill_type="solid")
@@ -893,9 +894,6 @@ class PannelloProdotti(PannelloBaseDialog):
           con la vista (non esclusi: l'utente potrebbe averne in giacenza
           da prima della messa in blacklist).
         """
-        import re
-        from datetime import datetime
-
         suffisso = "_fittizio" if self.mostra_fittizio else ""
         if self.azienda_filter:
             safe_name = re.sub(r'[\\/:*?"<>|]', '_', self.azienda_filter).replace(' ', '_')
@@ -913,8 +911,6 @@ class PannelloProdotti(PannelloBaseDialog):
         clausola_az = self._where_azienda_clause("rm")
 
         try:
-            import pandas as pd
-
             with self.engine.connect() as conn:
                 # Stesso calcolo di `aggiorna_dati`: SUM(CARICO) - SUM(SCARICO)
                 # per prodotto. Aggiungiamo anche conteggi N. movimenti +
@@ -964,7 +960,6 @@ class PannelloProdotti(PannelloBaseDialog):
                 df.to_excel(writer, sheet_name=sheet_name, index=False)
 
                 ws = writer.sheets[sheet_name]
-                from openpyxl.styles import Font, PatternFill, Alignment
 
                 # Header verde brand
                 header_font = Font(bold=True, color="FFFFFF")

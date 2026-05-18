@@ -379,18 +379,36 @@ def upload_pending(api: ApiClient, engine: Engine, notifier=None) -> tuple[int, 
                     local_ids = payload.get("local_ids", []) or []
                     server_trattamenti = op_resp.get("trattamenti", []) or []
                     if len(local_ids) != len(server_trattamenti):
+                        # Mismatch grave: il server HA già salvato (siamo nel
+                        # success-path della POST), ritentare duplicherebbe.
+                        # Swap parziale sui primi N (corretti per ordine);
+                        # cancelliamo comunque la pending op così non ritentiamo.
+                        # Eventuali trattamenti orfani arriveranno via reconcile
+                        # (potranno apparire come duplicati locali: ispezione
+                        # manuale, ma niente data-loss server-side).
                         log.error(
-                            "OPERAZIONE INSERT swap: len locali %d != len server %d",
+                            "OPERAZIONE INSERT swap: len locali %d != len server %d — swap parziale",
                             len(local_ids), len(server_trattamenti),
                         )
-                    _apply_operazione_swap(engine, local_ids, server_trattamenti,
-                                           op["id"], pending)
-                    pending_op_deleted = True
-                    # Per la soppressione eco SSE: prendiamo gli ID dei
-                    # trattamenti creati (ognuno emette il suo evento).
-                    server_ids_per_eco = [
-                        st.get("id") for st in server_trattamenti if st.get("id") is not None
-                    ]
+                        n = min(len(local_ids), len(server_trattamenti))
+                        _apply_operazione_swap(engine, local_ids[:n],
+                                               server_trattamenti[:n],
+                                               op["id"], pending)
+                        pending_op_deleted = True
+                        server_ids_per_eco = [
+                            st.get("id") for st in server_trattamenti
+                            if st.get("id") is not None
+                        ]
+                    else:
+                        _apply_operazione_swap(engine, local_ids, server_trattamenti,
+                                               op["id"], pending)
+                        pending_op_deleted = True
+                        # Per la soppressione eco SSE: prendiamo gli ID dei
+                        # trattamenti creati (ognuno emette il suo evento).
+                        server_ids_per_eco = [
+                            st.get("id") for st in server_trattamenti
+                            if st.get("id") is not None
+                        ]
                 else:
                     new_id = _extract_new_id(resp)
                     table = ENTITY_TO_TABLE.get(et)

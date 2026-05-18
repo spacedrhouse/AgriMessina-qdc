@@ -63,11 +63,31 @@ class EventsListener(QThread):
         # chiusura dell'app o il restart post-login.
         self._stop_event = threading.Event()
         self._connected = False
+        # Client httpx attivo (creato in _listen_one_session, vivo solo per la
+        # durata della sessione). Tenuto come attributo per poterlo chiudere
+        # dal main thread in stop(): senza, un read bloccato in iter_lines()
+        # non si scongela finché non scade il read_timeout (90s), e l'app
+        # restava appesa sul shutdown / re-login per quei secondi.
+        self._client: httpx.Client | None = None
+        self._client_lock = threading.Lock()
 
     def stop(self) -> None:
-        """Richiede la chiusura del thread. Sveglia immediatamente eventuali
-        wait di backoff così il thread esce in <1s."""
+        """Richiede la chiusura del thread. Sveglia i wait di backoff e chiude
+        il client httpx attivo: un eventuale iter_lines() bloccato esce con
+        ReadError, fa partire l'except del run() che vede _stop_event=True
+        e ritorna. Esito: il thread esce in <100ms invece di attendere il
+        read_timeout (fino a 90s)."""
         self._stop_event.set()
+        with self._client_lock:
+            client = self._client
+        if client is not None:
+            try:
+                client.close()
+            except Exception:
+                # Chiusura idempotente: se il client è già chiuso o il
+                # socket non risponde, log e via — non vogliamo che stop()
+                # sollevi durante uno shutdown.
+                log.debug("[events] errore chiudendo client httpx in stop() (atteso se già chiuso)")
 
     def run(self) -> None:
         backoff = _BACKOFF_INITIAL_SECONDS
@@ -129,34 +149,64 @@ class EventsListener(QThread):
         if token:
             headers["Authorization"] = f"Bearer {token}"
 
-        # timeout=None per il read (lo stream resta aperto). Connect timeout
-        # 10s per non bloccare indefinitamente se il server è giù.
+        # Connect timeout 10s per non bloccare indefinitamente se il server è
+        # giù. read=90s copre il keepalive del backend (30s di silenzio = ok),
+        # senza il read resterebbe appeso all'infinito se la rete cade
+        # brutalmente (drop senza FIN/RST).
         timeout = httpx.Timeout(connect=10.0, read=_READ_TIMEOUT_SECONDS,
                                 write=10.0, pool=10.0)
-        with httpx.stream("GET", url, headers=headers, timeout=timeout) as r:
-            if r.status_code == 401:
-                # Token scaduto. Solleviamo: il chiamante (MainWindow) gestirà
-                # con un dialog di re-login. Niente retry su 401, sarebbe loop.
-                raise httpx.HTTPStatusError("401", request=r.request, response=r)
-            r.raise_for_status()
-            self._set_connected(True)
-            log.info("[events] stream connesso")
-            for line in r.iter_lines():
-                if self._stop_event.is_set():
-                    return
-                if not line or line.startswith(":"):
-                    # Keepalive comment o riga vuota separatore.
-                    continue
-                if line.startswith("data: "):
-                    payload_str = line[len("data: "):]
-                    try:
-                        msg = json.loads(payload_str)
-                    except json.JSONDecodeError:
-                        log.warning("[events] payload non-JSON ignorato: %r", payload_str)
+        # Client esplicito (invece di httpx.stream module-level): così stop()
+        # dal main thread può chiamare client.close() e sbloccare un
+        # iter_lines() congelato. Pre-check: se stop è già stato richiesto
+        # tra due sessioni, non creare nemmeno il client.
+        if self._stop_event.is_set():
+            return
+        client = httpx.Client(timeout=timeout)
+        with self._client_lock:
+            self._client = client
+        # Re-check dopo aver pubblicato il client: se stop() era già arrivato
+        # tra il check di riga 162 e l'assegnamento sopra, avrebbe trovato
+        # self._client=None e saltato il close(), bloccandoci poi su iter_lines().
+        # Con questo re-check chiudiamo noi e usciamo subito.
+        if self._stop_event.is_set():
+            with self._client_lock:
+                self._client = None
+            client.close()
+            return
+        try:
+            with client.stream("GET", url, headers=headers) as r:
+                if r.status_code == 401:
+                    # Token scaduto. Solleviamo: il chiamante (MainWindow)
+                    # gestirà con un dialog di re-login. Niente retry su 401.
+                    raise httpx.HTTPStatusError("401", request=r.request, response=r)
+                r.raise_for_status()
+                self._set_connected(True)
+                log.info("[events] stream connesso")
+                for line in r.iter_lines():
+                    if self._stop_event.is_set():
+                        return
+                    if not line or line.startswith(":"):
+                        # Keepalive comment o riga vuota separatore.
                         continue
-                    event_type = msg.get("type", "")
-                    data = msg.get("payload") or {}
-                    if event_type:
-                        self.event_received.emit(event_type, data)
-        # Uscita pulita dal context manager = server ha chiuso lo stream.
-        self._set_connected(False)
+                    if line.startswith("data: "):
+                        payload_str = line[len("data: "):]
+                        try:
+                            msg = json.loads(payload_str)
+                        except json.JSONDecodeError:
+                            log.warning("[events] payload non-JSON ignorato: %r", payload_str)
+                            continue
+                        event_type = msg.get("type", "")
+                        data = msg.get("payload") or {}
+                        if event_type:
+                            self.event_received.emit(event_type, data)
+            # Uscita pulita dal context manager = server ha chiuso lo stream.
+            self._set_connected(False)
+        finally:
+            # Rilascia il riferimento PRIMA di close(): se stop() arriva ora,
+            # chiama close() su un client già chiuso (idempotente, gestito).
+            with self._client_lock:
+                self._client = None
+            try:
+                client.close()
+            except Exception:
+                pass

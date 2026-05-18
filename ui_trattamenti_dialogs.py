@@ -2697,6 +2697,12 @@ class DialogModificaTrattamento(DialogNuovoTrattamento):
                 return
 
         tot_area = sum(d['e'] for d in tendoni_sel)
+        if tot_area <= 0:
+            # Tendoni con 0 ettari (caso patologico ma possibile se il dato
+            # è stato corrotto a monte): la divisione `t['e'] / tot_area`
+            # crasherebbe con ZeroDivisionError.
+            QMessageBox.warning(self, "Attenzione", "Ettari totali = 0.")
+            return
         dati_prod = self.combo_prodotto.currentData()
         qta_tot = self.spin_qta_picker.value()
         botti_tot = self.spin_botti.value()

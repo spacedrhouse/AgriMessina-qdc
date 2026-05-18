@@ -300,9 +300,17 @@ def init_local_database(engine: Engine) -> None:
             "CREATE INDEX IF NOT EXISTS idx_dt_trattamento ON dettaglio_trattamenti(trattamento_id)",
             "CREATE INDEX IF NOT EXISTS idx_dt_tendone ON dettaglio_trattamenti(tendone_id)",
             "CREATE INDEX IF NOT EXISTS idx_dt_isbil ON dettaglio_trattamenti(is_bilanciamento)",
+            # Covering per la subquery COUNT(*) WHERE trattamento_id=:t AND
+            # is_bilanciamento=1 in aggiorna_dati delle liste trattamenti:
+            # senza, scansionava per ogni card (~2N lookup invece di N).
+            "CREATE INDEX IF NOT EXISTS idx_dt_trat_bil ON dettaglio_trattamenti(trattamento_id, is_bilanciamento)",
             "CREATE INDEX IF NOT EXISTS idx_t_prodotto ON trattamenti(prodotto_id)",
             "CREATE INDEX IF NOT EXISTS idx_t_isaut ON trattamenti(is_autorizzato)",
             "CREATE INDEX IF NOT EXISTS idx_t_data ON trattamenti(data_trattamento)",
+            # Composito per filtri "periodo + autorizzato" tipici dello
+            # Storico/Revisionati: idx_t_data da solo costringe SQLite a
+            # scegliere fra i due e a fare bitmap o scansione sul resto.
+            "CREATE INDEX IF NOT EXISTS idx_t_data_aut ON trattamenti(data_trattamento, is_autorizzato)",
             "CREATE INDEX IF NOT EXISTS idx_t_operazione ON trattamenti(operazione_id)",
             "CREATE INDEX IF NOT EXISTS idx_av_trat ON avvisi_trattamenti(trattamento_id)",
             # idx_rm_trattamento e idx_rm_prodotto sono già creati sopra
@@ -328,6 +336,34 @@ def init_local_database(engine: Engine) -> None:
         # Forza il reset del flag downloading: se l'app è crashata durante una
         # sync con flag=1, al riavvio i trigger continuerebbero a non accodare.
         conn.execute(text("UPDATE _sync_flags SET value = 0 WHERE key = 'downloading'"))
+
+        # Cleanup dead-letter > 90gg: senza, la tabella cresce indefinitamente
+        # (caso peggiore: utente con rete instabile genera centinaia di
+        # operazioni fallite/mese). Soglia generosa per dare tempo all'audit;
+        # i record conservano sempre `payload_json` per recupero manuale.
+        conn.execute(text(
+            "DELETE FROM dead_letter_operations "
+            "WHERE failed_at < datetime('now', '-90 days')"
+        ))
+
+        # Checkpoint WAL al boot: il file -wal può crescere indefinitamente
+        # se l'app gira a lungo (commit frequenti, mai chiusa). TRUNCATE
+        # forza il rebuild a 0 byte. PASSIVE non blocca i writer; se c'è
+        # contesa si limita a fare quel che può. Su Windows, un -wal grande
+        # rallenta i SELECT successivi (più pagine da consultare).
+        try:
+            conn.execute(text("PRAGMA wal_checkpoint(TRUNCATE)"))
+        except Exception:
+            # Su filesystem read-only o errori transitori non fermarsi:
+            # il checkpoint può sempre essere ritentato dopo.
+            pass
+        # PRAGMA optimize: SQLite aggiorna statistiche per il query planner
+        # in base ai pattern di utilizzo recenti. Raccomandato all'apertura
+        # del DB nei docs ufficiali; costo trascurabile su DB <100MB.
+        try:
+            conn.execute(text("PRAGMA optimize"))
+        except Exception:
+            pass
 
         # Trigger: se siamo in modalità "downloading" (= sync da server in corso),
         # NON accodiamo. Altrimenti registriamo l'operazione.
@@ -362,6 +398,7 @@ def _install_triggers(conn) -> None:
     _create("trg_aziende_au", """
         CREATE TRIGGER trg_aziende_au AFTER UPDATE ON aziende
         WHEN (SELECT value FROM _sync_flags WHERE key='downloading') = 0
+          AND OLD.nome IS NOT NEW.nome
         BEGIN
             INSERT INTO pending_operations (entity_type, operation_type, entity_id, payload_json)
             VALUES ('AZIENDA', 'UPDATE', NEW.id,
@@ -390,6 +427,7 @@ def _install_triggers(conn) -> None:
     _create("trg_agri_au", """
         CREATE TRIGGER trg_agri_au AFTER UPDATE ON agri
         WHEN (SELECT value FROM _sync_flags WHERE key='downloading') = 0
+          AND (OLD.azienda_id IS NOT NEW.azienda_id OR OLD.nome IS NOT NEW.nome)
         BEGIN
             INSERT INTO pending_operations (entity_type, operation_type, entity_id, payload_json)
             VALUES ('AGRO', 'UPDATE', NEW.id,
@@ -418,6 +456,7 @@ def _install_triggers(conn) -> None:
     _create("trg_contrade_au", """
         CREATE TRIGGER trg_contrade_au AFTER UPDATE ON contrade
         WHEN (SELECT value FROM _sync_flags WHERE key='downloading') = 0
+          AND (OLD.agro_id IS NOT NEW.agro_id OR OLD.nome IS NOT NEW.nome)
         BEGIN
             INSERT INTO pending_operations (entity_type, operation_type, entity_id, payload_json)
             VALUES ('CONTRADA', 'UPDATE', NEW.id,
@@ -446,6 +485,9 @@ def _install_triggers(conn) -> None:
     _create("trg_tendoni_au", """
         CREATE TRIGGER trg_tendoni_au AFTER UPDATE ON tendoni
         WHEN (SELECT value FROM _sync_flags WHERE key='downloading') = 0
+          AND (OLD.contrada_id IS NOT NEW.contrada_id
+               OR OLD.codice IS NOT NEW.codice
+               OR OLD.ettari IS NOT NEW.ettari)
         BEGIN
             INSERT INTO pending_operations (entity_type, operation_type, entity_id, payload_json)
             VALUES ('TENDONE', 'UPDATE', NEW.id,
@@ -484,6 +526,24 @@ def _install_triggers(conn) -> None:
     _create("trg_prodotti_au", """
         CREATE TRIGGER trg_prodotti_au AFTER UPDATE ON prodotti
         WHEN (SELECT value FROM _sync_flags WHERE key='downloading') = 0
+          AND (OLD.nome_prodotto IS NOT NEW.nome_prodotto
+               OR OLD.categoria IS NOT NEW.categoria
+               OR OLD.numero_registrazione IS NOT NEW.numero_registrazione
+               OR OLD.sostanza_attiva IS NOT NEW.sostanza_attiva
+               OR OLD.bio_convenzionale IS NOT NEW.bio_convenzionale
+               OR OLD.avversita IS NOT NEW.avversita
+               OR OLD.titolo_n IS NOT NEW.titolo_n
+               OR OLD.titolo_p IS NOT NEW.titolo_p
+               OR OLD.titolo_k IS NOT NEW.titolo_k
+               OR OLD.phi_giorni IS NOT NEW.phi_giorni
+               OR OLD.trattamenti_max IS NOT NEW.trattamenti_max
+               OR OLD.intervallo_min_tratt IS NOT NEW.intervallo_min_tratt
+               OR OLD.unita_misura IS NOT NEW.unita_misura
+               OR OLD.unita_carico IS NOT NEW.unita_carico
+               OR OLD.min_sostanza IS NOT NEW.min_sostanza
+               OR OLD.max_sostanza IS NOT NEW.max_sostanza
+               OR OLD.qta_acqua IS NOT NEW.qta_acqua
+               OR OLD.blacklist IS NOT NEW.blacklist)
         BEGIN
             INSERT INTO pending_operations (entity_type, operation_type, entity_id, payload_json)
             VALUES ('PRODOTTO', 'UPDATE', NEW.id,
@@ -541,6 +601,14 @@ def _install_triggers(conn) -> None:
         CREATE TRIGGER trg_magazzino_au AFTER UPDATE ON registro_magazzino
         WHEN (SELECT value FROM _sync_flags WHERE key='downloading') = 0
           AND NEW.trattamento_id IS NULL
+          AND (OLD.prodotto_id IS NOT NEW.prodotto_id
+               OR OLD.azienda_id IS NOT NEW.azienda_id
+               OR OLD.data_movimento IS NOT NEW.data_movimento
+               OR OLD.tipo_movimento IS NOT NEW.tipo_movimento
+               OR OLD.quantita IS NOT NEW.quantita
+               OR OLD.n_ddt IS NOT NEW.n_ddt
+               OR OLD.fornitore IS NOT NEW.fornitore
+               OR OLD.note IS NOT NEW.note)
         BEGIN
             INSERT INTO pending_operations (entity_type, operation_type, entity_id, payload_json)
             VALUES ('MOVIMENTO', 'UPDATE', NEW.id,
@@ -583,7 +651,13 @@ def get_sync_since(engine: Engine, entity: str) -> Optional[str]:
         return None
 
 
-def set_sync_since(engine: Engine, entity: str, server_time: str) -> None:
+def set_sync_since(engine: Engine, entity: str, server_time: Optional[str]) -> None:
+    # Se il server non restituisce server_time (risposta legacy, errore parziale,
+    # campo opzionale), non sovrascriviamo il valore esistente: alla prossima
+    # sync ripartiremo dalla `since` corrente. Sovrascrivere con "" rifletterebbe
+    # in una full-sync infinita ad ogni tick.
+    if not server_time:
+        return
     with engine.begin() as conn:
         conn.execute(text("""
             INSERT INTO sync_state (entity, server_time) VALUES (:e, :t)

@@ -515,7 +515,7 @@ def pull_trattamenti(api: ApiClient, engine: Engine, notifier=None) -> tuple:
 
         _delete_ids(engine, "trattamenti", safe_deletes)
         _upsert_trattamenti(engine, safe_items)
-        set_sync_since(engine, E_TRATTAMENTI, resp["server_time"])
+        set_sync_since(engine, E_TRATTAMENTI, resp.get("server_time"))
 
         # Se ci sono modifiche, refresha anche gli avvisi (lato server vengono
         # ricalcolati dopo ogni cambio trattamento)
@@ -561,7 +561,7 @@ def pull_movimenti(api: ApiClient, engine: Engine, notifier=None) -> tuple:
 
         _delete_ids(engine, "registro_magazzino", safe_deletes)
         _upsert_movimenti(engine, safe_items)
-        set_sync_since(engine, E_MAGAZZINO, resp["server_time"])
+        set_sync_since(engine, E_MAGAZZINO, resp.get("server_time"))
 
         return (len(safe_items), len(safe_deletes))
     finally:
@@ -582,35 +582,35 @@ def sync_all(api: ApiClient, engine: Engine) -> SyncResult:
         resp = api.sync_aziende(since)
         _upsert_aziende(engine, resp.get("items", []))
         _delete_ids(engine, "aziende", resp.get("deleted_ids", []))
-        set_sync_since(engine, E_AZIENDE, resp["server_time"])
+        set_sync_since(engine, E_AZIENDE, resp.get("server_time"))
 
         # 2) AGRI
         since = get_sync_since(engine, E_AGRI)
         resp = api.sync_agri(since)
         _upsert_agri(engine, resp.get("items", []))
         _delete_ids(engine, "agri", resp.get("deleted_ids", []))
-        set_sync_since(engine, E_AGRI, resp["server_time"])
+        set_sync_since(engine, E_AGRI, resp.get("server_time"))
 
         # 3) CONTRADE
         since = get_sync_since(engine, E_CONTRADE)
         resp = api.sync_contrade(since)
         _upsert_contrade(engine, resp.get("items", []))
         _delete_ids(engine, "contrade", resp.get("deleted_ids", []))
-        set_sync_since(engine, E_CONTRADE, resp["server_time"])
+        set_sync_since(engine, E_CONTRADE, resp.get("server_time"))
 
         # 4) TENDONI
         since = get_sync_since(engine, E_TENDONI)
         resp = api.sync_tendoni(since)
         _upsert_tendoni(engine, resp.get("items", []))
         _delete_ids(engine, "tendoni", resp.get("deleted_ids", []))
-        set_sync_since(engine, E_TENDONI, resp["server_time"])
+        set_sync_since(engine, E_TENDONI, resp.get("server_time"))
 
         # 5) PRODOTTI
         since = get_sync_since(engine, E_PRODOTTI)
         resp = api.sync_prodotti(since)
         _upsert_prodotti(engine, resp.get("items", []))
         _delete_ids(engine, "prodotti", resp.get("deleted_ids", []))
-        set_sync_since(engine, E_PRODOTTI, resp["server_time"])
+        set_sync_since(engine, E_PRODOTTI, resp.get("server_time"))
 
         # 6) TRATTAMENTI
         # Ordine: UPSERT prima, DELETE dopo (allineato alle altre entità).
@@ -621,14 +621,14 @@ def sync_all(api: ApiClient, engine: Engine) -> SyncResult:
         resp = api.sync_trattamenti(since)
         _upsert_trattamenti(engine, resp.get("items", []))
         _delete_ids(engine, "trattamenti", resp.get("deleted_ids", []))
-        set_sync_since(engine, E_TRATTAMENTI, resp["server_time"])
+        set_sync_since(engine, E_TRATTAMENTI, resp.get("server_time"))
 
         # 7) MAGAZZINO
         since = get_sync_since(engine, E_MAGAZZINO)
         resp = api.sync_movimenti(since=since)
         _upsert_movimenti(engine, resp.get("items", []))
         _delete_ids(engine, "registro_magazzino", resp.get("deleted_ids", []))
-        set_sync_since(engine, E_MAGAZZINO, resp["server_time"])
+        set_sync_since(engine, E_MAGAZZINO, resp.get("server_time"))
 
         # 8) AVVISI - strategia full-replace
         # Gli avvisi vengono ricalcolati interamente sul backend dopo ogni cambio
@@ -636,7 +636,7 @@ def sync_all(api: ApiClient, engine: Engine) -> SyncResult:
         # Ignoro `since`: il server restituisce sempre tutto.
         resp = api.sync_avvisi(since=None)
         _replace_avvisi(engine, resp.get("items", []))
-        set_sync_since(engine, E_AVVISI, resp["server_time"])
+        set_sync_since(engine, E_AVVISI, resp.get("server_time"))
 
         return SyncResult(True, "Sync completata")
 
