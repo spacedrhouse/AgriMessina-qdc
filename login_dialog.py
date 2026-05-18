@@ -77,9 +77,9 @@ class LoginDialog(QDialog):
         layout.addWidget(lbl_title)
 
         # Username
-        layout.addWidget(QLabel("Email:"))
+        layout.addWidget(QLabel("Email/Nome Utente:"))
         self.et_username = QLineEdit()
-        self.et_username.setPlaceholderText("nome@esempio.it")
+        self.et_username.setPlaceholderText("nome@esempio.it o username")
         self.et_username.setStyleSheet("padding: 8px; font-size: 13px;")
         layout.addWidget(self.et_username)
 
@@ -158,7 +158,7 @@ class LoginDialog(QDialog):
         # inspiegabili.
         pwd = self.et_password.text()
         if not user or not pwd:
-            QMessageBox.warning(self, "Campi vuoti", "Inserisci email e password.")
+            QMessageBox.warning(self, "Campi vuoti", "Inserisci email/nome utente e password.")
             return
 
         self.btn_login.setEnabled(False)

@@ -356,10 +356,13 @@ class FinestraPrincipale(QMainWindow):
         self.pagine.addWidget(SchedaOperazioni(self.engine, self.db, tipo_vista="AUTORIZZATI", api=self.api, notifier=self.notifier))
         # Tre vedute magazzino, una per azienda. "Messina Alfio" include
         # automaticamente l'alias Deflorio Ciccopinto (vedi WAREHOUSE_ALIASES).
-        self.pagine.addWidget(PannelloProdotti(self.engine, self.db, azienda_filter="Agrimessina"))
-        self.pagine.addWidget(PannelloProdotti(self.engine, self.db, azienda_filter="La Gazzella"))
-        self.pagine.addWidget(PannelloProdotti(self.engine, self.db, azienda_filter="Messina Alfio"))
-        self.pagine.addWidget(PannelloTendoni(self.engine, self.db))
+        # `api=self.api` esplicito così il pannello può controllare is_admin
+        # in __init__: il walk-up parent non funziona finché il widget non
+        # è ancora stato aggiunto al QStackedWidget.
+        self.pagine.addWidget(PannelloProdotti(self.engine, self.db, azienda_filter="Agrimessina", api=self.api))
+        self.pagine.addWidget(PannelloProdotti(self.engine, self.db, azienda_filter="La Gazzella", api=self.api))
+        self.pagine.addWidget(PannelloProdotti(self.engine, self.db, azienda_filter="Messina Alfio", api=self.api))
+        self.pagine.addWidget(PannelloTendoni(self.engine, self.db, api=self.api))
         self.pagine.addWidget(PannelloContrade(self.engine, self.db))
         self.pagine.addWidget(PannelloAgri(self.engine, self.db))
         self.pagine.addWidget(PannelloAziende(self.engine, self.db))
@@ -429,6 +432,13 @@ class FinestraPrincipale(QMainWindow):
         tray = getattr(self, "tray", None)
         if tray is not None:
             tray.hide()
+        # Logout esplicito: cancella il token persistito così alla prossima
+        # apertura l'app richiede di nuovo le credenziali. Policy di
+        # sicurezza: la sessione non sopravvive alla chiusura dell'app.
+        try:
+            self.api.logout()
+        except Exception as e:
+            log.warning("Logout su chiusura fallito: %s", e)
         # Chiude il pool httpx — evita "Unclosed client" warning a shutdown.
         try:
             self.api.close()
@@ -1144,45 +1154,73 @@ class FinestraPrincipale(QMainWindow):
                     events_listener.quit()
                     events_listener.wait(1000)
 
-            self.api.logout()
+            # Nascondiamo subito la finestra: la UI del vecchio utente
+            # alle spalle del LoginDialog era confondente.
+            self.hide()
 
             from login_dialog import LoginDialog
             login = LoginDialog(self.api)
             if login.exec() != login.DialogCode.Accepted:
-                # L'utente ha annullato: meglio chiudere che lasciare l'app
-                # in stato inconsistente (ogni richiesta sarebbe 401).
+                # L'utente ha annullato: forziamo il logout (cancella token
+                # persistito) e chiudiamo l'app.
+                self.api.logout()
                 self.close()
                 return
 
-            # Login OK: riprendiamo i cicli di sync.
-            for timer, interval in (
-                (getattr(self, "timer_autosync", None), CONFIG.autosync_ms),
-                (getattr(self, "timer_reconcile", None), CONFIG.reconcile_ms),
-                (getattr(self, "timer_status", None), CONFIG.status_update_ms),
-            ):
-                if timer:
-                    timer.start(interval)
-
-            # Rilancia il listener SSE con il nuovo token. L'istanza precedente
-            # è già stata stoppata sopra: la marchiamo per la cancellazione,
-            # altrimenti resterebbe come child di self e si accumulerebbe a ogni
-            # re-login.
-            old_listener = getattr(self, "events_listener", None)
-            if old_listener is not None:
-                old_listener.deleteLater()
-            self.events_listener = EventsListener(self.api, parent=self)
-            self.events_listener.event_received.connect(self._on_server_event)
-            # Stessa quaterna di connessioni del setup iniziale: senza queste,
-            # dopo un re-login le notifiche tray sparivano e una eventuale
-            # seconda scadenza del token non triggerava più il LoginDialog.
-            self.events_listener.event_received.connect(self._on_event_notify)
-            self.events_listener.connection_changed.connect(self._on_events_connection)
-            self.events_listener.auth_expired.connect(self._handle_session_expired)
-            self.events_listener.start()
-
-            self.notifier.info("Sessione ripristinata")
+            # Login OK col NUOVO utente: per applicare correttamente i
+            # permessi del ruolo (BASIC vs ADMIN cambia sidebar, bottoni
+            # bilanciamento, lista trattamenti nei Tendoni, ecc.) la cosa
+            # più sicura è rilanciare l'app da zero invece di ricostruire
+            # in-place — l'in-place rebuild aveva race con i signal dei
+            # vecchi widget (notifier/SSE/timer) che li aggredivano dopo
+            # che setCentralWidget li aveva schedulati per deleteLater,
+            # causando crash.
+            #
+            # Il token del nuovo utente è già stato salvato in
+            # ~/.agrimessina/auth.json da api.login(), quindi l'app
+            # ripartirà autenticata come il nuovo utente.
+            log.info("Re-login completato, rilancio l'app per applicare i permessi")
+            self._relogin_in_progress = False  # reset prima di chiudere
+            self._restart_app()
+            return
         finally:
             self._relogin_in_progress = False
+
+    def _restart_app(self):
+        """Chiude l'app e la riavvia come nuovo processo.
+
+        Usato dopo un re-login: serve perché molti pezzi della UI (sidebar,
+        permessi BASIC, dialog cache) sono inizializzati una sola volta a
+        boot leggendo `self.api.is_admin`. Ricostruire in-place ha race
+        condition con i signal vecchi e crasha.
+
+        `os.execv` rimpiazza il processo corrente con un nuovo Python che
+        riesegue lo stesso script — più pulito di subprocess+sys.exit
+        perché non lascia processi zombie.
+        """
+        import os
+        import sys
+        # Salviamo lo stato finestra prima di chiudere (geometria, ecc.)
+        try:
+            self._qsettings.setValue("window/geometry", self.saveGeometry())
+            self._qsettings.sync()
+        except Exception:
+            pass
+        # Cleanup risorse critiche per evitare warning su file lock SQLite,
+        # connessioni HTTP unclosed, ecc.
+        try:
+            self.api.close()
+        except Exception:
+            pass
+        # execv rimpiazza il processo. Su Windows è meglio Popen+exit per
+        # evitare quirks della shell argv quoting.
+        if sys.platform == "win32":
+            import subprocess
+            subprocess.Popen([sys.executable] + sys.argv,
+                             creationflags=subprocess.CREATE_NEW_PROCESS_GROUP)
+            sys.exit(0)
+        else:
+            os.execv(sys.executable, [sys.executable] + sys.argv)
 
     def _on_logout_clicked(self):
         ans = QMessageBox.question(

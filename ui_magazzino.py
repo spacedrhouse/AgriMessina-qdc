@@ -611,22 +611,38 @@ class DialogRegistroProdotto(QDialog):
 class PannelloProdotti(PannelloBaseDialog):
     COLONNE_NASCOSTE = [0]
 
-    def __init__(self, engine, db, azienda_filter: str):
+    def __init__(self, engine, db, azienda_filter: str, api=None):
         """
         Args:
             azienda_filter: nome dell'azienda magazzino (es. "Agrimessina").
                 Il pannello mostra solo i movimenti/giacenze di quell'azienda
                 + degli alias che mappano su di essa (vedi WAREHOUSE_ALIASES).
+            api: ApiClient per leggere il ruolo utente. Va passato esplicito
+                perché il walk-up parent fallisce: il pannello viene istanziato
+                come espressione dentro addWidget, quindi durante l'__init__
+                non ha ancora parent (vedi commento in MainWindow._build_ui).
         """
         super().__init__()
-        self.engine, self.db = engine, db
+        self.engine, self.db, self.api = engine, db, api
         self.azienda_filter = azienda_filter
         self.azienda_ids = self._resolve_filter_ids()  # lista per IN clause SQL
 
-        # Toggle reale ↔ fittizio. False = reale (default), True = fittizio.
+        # Permessi ruolo (silent: niente warning, l'UI è semplicemente
+        # adattata). BASIC vede solo la giacenza fittizia, niente toggle,
+        # niente modifica manuale dei record (doubleClick disabilitato).
+        # Fallback walk-up se per qualche motivo api non è stato passato
+        # (es. pannello istanziato fuori dal flusso main).
+        if api is not None and hasattr(api, "is_admin"):
+            self._is_admin = bool(api.is_admin)
+        else:
+            from ui_trattamenti_dialogs import _utente_e_admin
+            self._is_admin = _utente_e_admin(self)
+
+        # Toggle reale ↔ fittizio. False = reale (default ADMIN), True = fittizio.
         # In modalità fittizio i bottoni di modifica manuale sono disabilitati:
         # il fittizio è popolato solo automaticamente dai trattamenti revisionati.
-        self.mostra_fittizio = False
+        # Per BASIC è sempre True: vedono solo lo stato post-revisione.
+        self.mostra_fittizio = not self._is_admin
 
         self.btn_export_tutti_mov = QPushButton("📊 Esporta Movimenti")
         self.btn_export_tutti_mov.setProperty('class', 'success')
@@ -639,19 +655,25 @@ class PannelloProdotti(PannelloBaseDialog):
         self.btn_export_giacenze.setProperty('class', 'success')
         self.btn_export_giacenze.clicked.connect(self._esporta_giacenze)
 
-        # Toggle reale ↔ fittizio. Classe `secondary` (blu): nel QSS globale
-        # esistono solo success/warning/danger/secondary; "primary" non c'è e
-        # ricadeva nel default Qt fuori standard.
-        self.btn_toggle_fittizio = QPushButton("📋 Mostra Fittizio")
-        self.btn_toggle_fittizio.setProperty('class', 'secondary')
-        self.btn_toggle_fittizio.clicked.connect(self._toggle_fittizio)
-
         top_layout = self.layout().itemAt(0).layout()
         top_layout.insertWidget(4, self.btn_export_tutti_mov)
         top_layout.insertWidget(5, self.btn_export_giacenze)
-        top_layout.insertWidget(6, self.btn_toggle_fittizio)
 
-        self.vista.doubleClicked.connect(self._on_doppio_click)
+        # Toggle reale ↔ fittizio: ADMIN-only. BASIC non vede il bottone.
+        # Classe `secondary` (blu): nel QSS globale esistono solo
+        # success/warning/danger/secondary; "primary" non c'è e ricadeva
+        # nel default Qt fuori standard.
+        if self._is_admin:
+            self.btn_toggle_fittizio = QPushButton("📋 Mostra Fittizio")
+            self.btn_toggle_fittizio.setProperty('class', 'secondary')
+            self.btn_toggle_fittizio.clicked.connect(self._toggle_fittizio)
+            top_layout.insertWidget(6, self.btn_toggle_fittizio)
+
+        # Doppio click sui record: ADMIN-only. Apre DialogRegistroProdotto
+        # che permette di modificare carichi/scarichi manuali — non ha
+        # senso per BASIC che vede solo il fittizio post-revisione.
+        if self._is_admin:
+            self.vista.doubleClicked.connect(self._on_doppio_click)
         self.aggiorna_dati()
 
     def _tabella(self) -> str:

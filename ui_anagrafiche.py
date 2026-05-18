@@ -416,9 +416,9 @@ class DialogTendone(QDialog):
 class PannelloTendoni(PannelloBaseDialog):
     COLONNE_NASCOSTE = [0, 5, 7]
 
-    def __init__(self, engine, db):
+    def __init__(self, engine, db, api=None):
         super().__init__()
-        self.engine, self.db = engine, db
+        self.engine, self.db, self.api = engine, db, api
         self.modalita_analisi = False # Flag di stato: inizia in modalità "Lista Base"
 
         # --- 1. SETUP BARRA FILTRO (INIZIALMENTE NASCOSTA) ---
@@ -442,11 +442,15 @@ class PannelloTendoni(PannelloBaseDialog):
         self.combo_filtro.currentIndexChanged.connect(self.aggiorna_dati)
 
         # Permessi BASIC: niente accesso alla lista trattamenti per tendone.
-        # Cerchiamo il ruolo sull'ApiClient navigando la catena parent (questo
-        # widget è child della QStackedWidget → MainWindow); lo stesso helper
-        # è usato anche dai dialog di bilanciamento.
-        from ui_trattamenti_dialogs import _utente_e_admin
-        self._is_admin = _utente_e_admin(self)
+        # `api` passato esplicitamente da MainWindow._build_ui: il walk-up
+        # parent NON funziona durante __init__ perché il pannello è
+        # istanziato come espressione dentro addWidget(), quindi non ha
+        # ancora un parent. Fallback al walk-up se api non disponibile.
+        if api is not None and hasattr(api, "is_admin"):
+            self._is_admin = bool(api.is_admin)
+        else:
+            from ui_trattamenti_dialogs import _utente_e_admin
+            self._is_admin = _utente_e_admin(self)
 
         # --- 2. SETUP PULSANTE LISTA TRATTAMENTI ---
         # Stessa classe blu (`secondary`) usata da Aggiorna/Mostra Fittizio

@@ -125,7 +125,11 @@ class ApiClient:
     def ruolo(self) -> Optional[str]:
         return self._ruolo
 
+    @property
     def is_admin(self) -> bool:
+        """True se l'utente loggato è ADMIN. Property (non metodo) così
+        l'uso `self.api.is_admin` ritorna sempre il bool, non l'oggetto
+        metodo (che era truthy anche per BASIC → bypass dei permessi)."""
         return (self._ruolo or "").upper() == "ADMIN"
 
     # ---- chiamate base ------------------------------------------------------
