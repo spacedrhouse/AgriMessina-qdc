@@ -2264,14 +2264,23 @@ class DialogNuovoTrattamento(QDialog):
 
     def _inizializza_dati(self):
         with self.engine.connect() as conn:
-            # Includiamo `categoria` per pilotare visibilità modalità fertilizzazione.
+            # Includiamo `categoria` (modalità fertilizzazione) e
+            # unita_carico/qta_per_unita_carico (gestione "Confezione"-like).
             for p in conn.execute(text(
-                "SELECT id, nome_prodotto, unita_misura, categoria FROM prodotti "
-                "ORDER BY nome_prodotto"
+                "SELECT id, nome_prodotto, unita_misura, categoria, "
+                "unita_carico, qta_per_unita_carico, um_qta_per_unita_carico "
+                "FROM prodotti ORDER BY nome_prodotto"
             )).fetchall():
                 self.combo_prodotto.addItem(
                     p[1],
-                    userData={'id': p[0], 'um': p[2] or '', 'categoria': (p[3] or '').strip()}
+                    userData={
+                        'id': p[0],
+                        'um': p[2] or '',
+                        'categoria': (p[3] or '').strip(),
+                        'unita_carico': (p[4] or '').strip() or None,
+                        'qta_per_unita_carico': p[5],
+                        'um_qta_per_unita_carico': (p[6] or '').strip() or None,
+                    },
                 )
             for az in conn.execute(text("SELECT id, nome FROM aziende ORDER BY nome")).fetchall():
                 self.combo_azienda.addItem(az[1], userData=az[0])
@@ -2313,12 +2322,22 @@ class DialogNuovoTrattamento(QDialog):
             self.combo_operatore.addItem(label)
 
     def _on_prodotto_picker_changed(self, _idx: int):
-        """Mostra il combo modalità fertilizzazione solo per prodotti Fert."""
+        """Mostra il combo modalità fertilizzazione solo per prodotti Fert.
+        Aggiorna il suffisso del campo Quantità con l'UM di carico (es. "Conf"
+        per prodotti venduti a confezione, "kg"/"L" per UM standard)."""
         dati = self.combo_prodotto.currentData()
         is_fert = isinstance(dati, dict) and dati.get('categoria') == 'Fert'
         self.combo_modalita_fert.setVisible(is_fert)
         if not is_fert:
             self.combo_modalita_fert.setCurrentIndex(0)
+        # Suffisso qta = unita_carico se settata, altrimenti numeratore di UM
+        # (così l'utente vede "Conf" / "kg" / "L" accanto al numero).
+        if isinstance(dati, dict):
+            uc = (dati.get('unita_carico') or '').strip()
+            if not uc:
+                um = (dati.get('um') or '').strip()
+                uc = um.split('/')[0] if '/' in um else um
+            self.spin_qta_picker.setSuffix(f" {uc}" if uc else "")
 
     def _aggiungi_prodotto_selezionato(self):
         """Sposta il prodotto correntemente nel combo dentro la lista selezionati."""
@@ -2346,9 +2365,33 @@ class DialogNuovoTrattamento(QDialog):
         tipo = "Fertilizzazione" if is_fert else "Difesa"
 
         nome = self.combo_prodotto.currentText()
+        # Se il prodotto ha unita_carico "Confezione" (o altra UM con
+        # qta_per_unita_carico), l'utente ha inserito N confezioni: convertiamo
+        # in numeratore UM (es. L) per il salvataggio nel dettaglio. La dose
+        # effettiva e gli scarichi magazzino così risultano coerenti.
+        from ui_magazzino import carico_to_numeratore
+        prod_ref = {
+            "nome_prodotto": nome,
+            "unita_misura": dati.get('um', ''),
+            "unita_carico": dati.get('unita_carico'),
+            "qta_per_unita_carico": dati.get('qta_per_unita_carico'),
+            "um_qta_per_unita_carico": dati.get('um_qta_per_unita_carico'),
+        }
+        try:
+            qta_storage = carico_to_numeratore(qta, prod_ref)
+        except ValueError as e:
+            QMessageBox.warning(self, "Conversione UM", str(e))
+            return
         self._prodotti_selezionati.append({
             'id': dati['id'], 'nome': nome, 'um': dati.get('um', ''),
-            'qta': qta, 'tipo': tipo, 'modalita': modalita,
+            'qta': qta_storage,
+            # Tracciamo anche la qta originale e l'UM di carico per il display
+            # nella lista prodotti selezionati ("10 Conf" anziché "5.75 L").
+            'qta_carico': qta,
+            'unita_carico': dati.get('unita_carico'),
+            'qta_per_unita_carico': dati.get('qta_per_unita_carico'),
+            'um_qta_per_unita_carico': dati.get('um_qta_per_unita_carico'),
+            'tipo': tipo, 'modalita': modalita,
         })
         self._ridisegna_lista_prodotti_sel()
 

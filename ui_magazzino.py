@@ -25,6 +25,76 @@ _MASSA_AL_KG = {"mg": 1e-6, "g": 1e-3, "kg": 1.0}
 _VOLUME_AL_L = {"ml": 1e-3, "l": 1.0}
 
 
+def carico_to_numeratore(
+    qta_user: float,
+    prodotto: dict | None,
+) -> float:
+    """Converte la quantità inserita dall'utente in unita_carico nella
+    quantità in **numeratore di unita_misura** del prodotto.
+
+    Regole:
+      - Se `unita_carico` è una UM standard (mg/g/kg/ml/l/Unità): usa la
+        tabella massa/volume (`converti_qta`) per scalare al numeratore.
+      - Se `unita_carico` == "Confezione": il valore N viene moltiplicato per
+        `qta_per_unita_carico`. Quest'ultimo è espresso in
+        `um_qta_per_unita_carico` (es. "ml") e poi convertito al numeratore
+        di `unita_misura` (es. "L"). Esempio Orondis:
+        qta_per_unita_carico=575, um_qta_per_unita_carico="ml", unita_misura="L/ha":
+        4 Conf × 575 ml = 2300 ml → 2.3 L.
+        Se `um_qta_per_unita_carico` non è valorizzata, si assume il
+        numeratore di unita_misura (retro-compatibile).
+      - Per prodotti senza `unita_carico` o senza `unita_misura`: identità.
+
+    Solleva ValueError se "Confezione" è selezionata ma `qta_per_unita_carico`
+    è None o ≤ 0: il dato è inconsistente in anagrafica e va corretto.
+    """
+    if qta_user is None or prodotto is None:
+        return qta_user
+    uc = (prodotto.get("unita_carico") or "").strip()
+    um = (prodotto.get("unita_misura") or "").strip()
+    if not uc or not um:
+        return qta_user
+    num = um.split('/')[0].strip().lower()
+    if uc.lower() == "confezione":
+        fattore = prodotto.get("qta_per_unita_carico")
+        if not fattore or float(fattore) <= 0:
+            raise ValueError(
+                f"Prodotto «{prodotto.get('nome_prodotto', '?')}» ha "
+                "unita_carico='Confezione' ma manca qta_per_unita_carico. "
+                "Aggiorna l'anagrafica del prodotto."
+            )
+        um_fatt = (prodotto.get("um_qta_per_unita_carico") or num).strip().lower() or num
+        qta_in_um_fatt = float(qta_user) * float(fattore)
+        return converti_qta(qta_in_um_fatt, um_fatt, num)
+    # UM standard: massa↔massa o volume↔volume
+    return converti_qta(qta_user, uc, num)
+
+
+def numeratore_to_carico(
+    qta_num: float,
+    prodotto: dict | None,
+) -> float:
+    """Inverso di `carico_to_numeratore`. Usato in display per mostrare
+    "10 Conf" anziché "5.75 L" sul prodotto Orondis quando l'utente legge
+    una lista (carichi, scarichi, trattamenti).
+    """
+    if qta_num is None or prodotto is None:
+        return qta_num
+    uc = (prodotto.get("unita_carico") or "").strip()
+    um = (prodotto.get("unita_misura") or "").strip()
+    if not uc or not um:
+        return qta_num
+    num = um.split('/')[0].strip().lower()
+    if uc.lower() == "confezione":
+        fattore = prodotto.get("qta_per_unita_carico")
+        if not fattore or float(fattore) <= 0:
+            return qta_num  # graceful: meglio mostrare in litri che None
+        um_fatt = (prodotto.get("um_qta_per_unita_carico") or num).strip().lower() or num
+        qta_in_um_fatt = converti_qta(qta_num, num, um_fatt)
+        return float(qta_in_um_fatt) / float(fattore)
+    return converti_qta(qta_num, num, uc)
+
+
 def converti_qta(qta: float, da_um: str | None, a_um: str | None) -> float:
     """Converte `qta` da `da_um` a `a_um`. Identità se UM uguali, vuote o
     sconosciute (es. "Unità"), o se le due UM appartengono a categorie diverse
@@ -60,6 +130,13 @@ class DialogProdotto(QDialog):
         ("intervallo_min_tratt",     "Intervallo Minimo (giorni)", "intero",       None),
         ("unita_misura",             "Unità di Misura",            "combo",        ["", "L/ha", "kg/ha", "ml/ha", "g/ha", "g/hl", "ml/hl", "unità/ha"]),
         ("unita_carico",             "Unità di Carico",            "combo",        [""]),
+        # Fattore di conversione 1 unita_carico → X (espresso in um_qta_per_unita_carico).
+        # Usato per UM non-standard tipo "Confezione" (es. Orondis: qta_per_unita_carico=575,
+        # um_qta_per_unita_carico="ml" → 1 Conf = 575 ml).
+        # Lasciare vuoto per UM standard (la conversione avviene via tabella massa/volume).
+        ("qta_per_unita_carico",     "Qta per Unità di Carico",    "decimal",      None),
+        # UM in cui è espresso `qta_per_unita_carico`. Lasciare vuoto = numeratore di unita_misura.
+        ("um_qta_per_unita_carico",  "UM Qta per Unità di Carico", "combo",        ["", "mg", "g", "kg", "ml", "L"]),
         ("min_sostanza",             "Dose Minima",                "decimal",      None),
         ("max_sostanza",             "Dose Massima",               "decimal",      None),
         ("qta_acqua",                "Quantità Acqua (L/ha)",      "decimal",      None),
@@ -69,16 +146,21 @@ class DialogProdotto(QDialog):
     @staticmethod
     def opzioni_unita_carico(unita_misura: str | None) -> list[str]:
         """UM ammesse per i carichi manuali in funzione del numeratore di
-        `unita_misura`. Lista vuota se l'UM non è ancora stata scelta."""
+        `unita_misura`. Lista vuota se l'UM non è ancora stata scelta.
+
+        "Confezione" è opzione globale per UM massa/volume: serve per prodotti
+        venduti a confezione (es. Orondis). Va sempre accompagnata da un
+        valore valido in `qta_per_unita_carico` (1 Conf = X numeratore_UM).
+        """
         if not unita_misura:
             return []
         num = str(unita_misura).split('/')[0].strip().lower()
         if num in ('mg', 'g', 'kg'):
-            return ['mg', 'g', 'kg']
+            return ['mg', 'g', 'kg', 'Confezione']
         if num in ('ml', 'l'):
-            return ['ml', 'l']
+            return ['ml', 'l', 'Confezione']
         if num == 'unità':
-            return ['Unità']
+            return ['Unità', 'Confezione']
         return []
 
     def __init__(self, engine, dati=None, parent=None):
@@ -252,7 +334,8 @@ class DialogProdotto(QDialog):
                 QMessageBox.critical(self, "Errore Database", f"Salvataggio fallito: {messaggio}")
 
 class DialogNuovoMovimento(QDialog):
-    def __init__(self, engine, prodotto_id, um, parent=None, unita_carico=None):
+    def __init__(self, engine, prodotto_id, um, parent=None, unita_carico=None,
+                 qta_per_unita_carico=None, um_qta_per_unita_carico=None):
         super().__init__(parent)
         self.engine = engine
         self.prodotto_id = prodotto_id
@@ -260,8 +343,21 @@ class DialogNuovoMovimento(QDialog):
         # interna in cui il registro_magazzino storerà la quantità.
         # `unita_carico`: unità con cui l'utente inserisce (es. "kg"). Se None
         #  o uguale a `um`, nessuna conversione viene applicata.
+        # `qta_per_unita_carico`: fattore custom per "Confezione" (es. 575).
+        # `um_qta_per_unita_carico`: UM in cui è espresso il fattore (es. "ml").
         self.um_interna = str(um or "")
         self.unita_carico = str(unita_carico or "").strip() or self.um_interna
+        self.qta_per_unita_carico = qta_per_unita_carico
+        self.um_qta_per_unita_carico = um_qta_per_unita_carico
+        # Mini-dict per riusare gli helper carico_to_numeratore/numeratore_to_carico.
+        self._prod_ref = {
+            "nome_prodotto": "",
+            "unita_misura": self.um_interna,  # numeratore (es. "L"); l'helper
+            # lavora ancora correttamente perché split('/') ritorna tutto.
+            "unita_carico": self.unita_carico,
+            "qta_per_unita_carico": qta_per_unita_carico,
+            "um_qta_per_unita_carico": um_qta_per_unita_carico,
+        }
         self.setWindowTitle("Registra Movimento Magazzino")
         self.setMinimumWidth(400)
 
@@ -316,7 +412,13 @@ class DialogNuovoMovimento(QDialog):
         layout.addLayout(btns)
 
     def _aggiorna_anteprima_conversione(self, valore: float) -> None:
-        convertito = converti_qta(valore, self.unita_carico, self.um_interna)
+        # Usa l'helper che gestisce sia UM standard sia "Confezione"
+        # (fattore custom dal prodotto).
+        try:
+            convertito = carico_to_numeratore(valore, self._prod_ref)
+        except ValueError as e:
+            self.lbl_convertito.setText(f"⚠ {e}")
+            return
         self.lbl_convertito.setText(
             f"≡ {convertito:.4f} {self.um_interna} nel registro"
         )
@@ -327,8 +429,9 @@ class DialogNuovoMovimento(QDialog):
             # imprecisione float (es. 0.7 kg -> 699.999...g, salvato, riaperto
             # -> 0.6999... kg, salvato, ecc). 6 decimali sono sufficienti per
             # tutte le UM supportate (mg = 1e-6 kg).
-            qta_storage = round(converti_qta(self.spin_qta.value(),
-                                             self.unita_carico, self.um_interna), 6)
+            qta_storage = round(
+                carico_to_numeratore(self.spin_qta.value(), self._prod_ref), 6
+            )
             with self.engine.begin() as conn:
                 conn.execute(text("""
                     INSERT INTO registro_magazzino (prodotto_id, azienda_id, data_movimento, tipo_movimento, quantita, n_ddt, fornitore, note)
@@ -344,7 +447,8 @@ class DialogNuovoMovimento(QDialog):
 
 
 class DialogModificaMovimento(QDialog):
-    def __init__(self, engine, dati, um, parent=None, unita_carico=None):
+    def __init__(self, engine, dati, um, parent=None, unita_carico=None,
+                 qta_per_unita_carico=None, um_qta_per_unita_carico=None):
         super().__init__(parent)
         self.engine = engine
         self.id_mov = dati['id']
@@ -354,6 +458,15 @@ class DialogModificaMovimento(QDialog):
         # visualizzazione e ri-convertita al salvataggio.
         self.um_interna = str(um or "")
         self.unita_carico = str(unita_carico or "").strip() or self.um_interna
+        self.qta_per_unita_carico = qta_per_unita_carico
+        self.um_qta_per_unita_carico = um_qta_per_unita_carico
+        self._prod_ref = {
+            "nome_prodotto": "",
+            "unita_misura": self.um_interna,
+            "unita_carico": self.unita_carico,
+            "qta_per_unita_carico": qta_per_unita_carico,
+            "um_qta_per_unita_carico": um_qta_per_unita_carico,
+        }
         self.setWindowTitle("Modifica Movimento Magazzino")
 
         layout = QVBoxLayout(self)
@@ -383,9 +496,9 @@ class DialogModificaMovimento(QDialog):
         self.spin_qta.setDecimals(4)
         self.spin_qta.setSuffix(f" {self.unita_carico}")
         # Converte la qta storata (in um_interna) verso unita_carico per
-        # mostrarla nell'UM con cui l'utente l'aveva inserita.
-        self.spin_qta.setValue(converti_qta(float(dati['qta']),
-                                            self.um_interna, self.unita_carico))
+        # mostrarla nell'UM con cui l'utente l'aveva inserita. Helper gestisce
+        # "Confezione" + qta_per_unita_carico (es. 5.75 L → 10 Conf).
+        self.spin_qta.setValue(numeratore_to_carico(float(dati['qta']), self._prod_ref))
 
         self.lbl_convertito = QLabel("")
         self.lbl_convertito.setStyleSheet("color: #757575; font-size: 11px;")
@@ -413,7 +526,11 @@ class DialogModificaMovimento(QDialog):
         layout.addWidget(btn_salva)
 
     def _aggiorna_anteprima_conversione(self, valore: float) -> None:
-        convertito = converti_qta(valore, self.unita_carico, self.um_interna)
+        try:
+            convertito = carico_to_numeratore(valore, self._prod_ref)
+        except ValueError as e:
+            self.lbl_convertito.setText(f"⚠ {e}")
+            return
         self.lbl_convertito.setText(
             f"≡ {convertito:.4f} {self.um_interna} nel registro"
         )
@@ -424,8 +541,9 @@ class DialogModificaMovimento(QDialog):
             # imprecisione float (es. 0.7 kg -> 699.999...g, salvato, riaperto
             # -> 0.6999... kg, salvato, ecc). 6 decimali sono sufficienti per
             # tutte le UM supportate (mg = 1e-6 kg).
-            qta_storage = round(converti_qta(self.spin_qta.value(),
-                                             self.unita_carico, self.um_interna), 6)
+            qta_storage = round(
+                carico_to_numeratore(self.spin_qta.value(), self._prod_ref), 6
+            )
             with self.engine.begin() as conn:
                 conn.execute(text("""
                     UPDATE registro_magazzino SET azienda_id=:az, data_movimento=:d, tipo_movimento=:tipo,
@@ -460,12 +578,18 @@ class DialogRegistroProdotto(QDialog):
         self.um_pulita = self.um.split('/')[0].strip() if '/' in self.um else self.um
 
         # `unita_carico`: UM con cui l'utente inserisce i carichi manuali.
-        # I dialog di nuovo/modifica la useranno come unità di input e
-        # convertiranno in `um_pulita` (UM "interna" del registro) al salvataggio.
+        # `qta_per_unita_carico`: fattore custom per UM "Confezione" (es. 575).
+        # `um_qta_per_unita_carico`: UM in cui è espresso il fattore (es. "ml").
+        # I dialog di nuovo/modifica useranno tutti e tre per la conversione
+        # corretta verso `um_pulita` (UM "interna" del registro).
         with self.engine.connect() as conn:
-            self.unita_carico = conn.execute(text(
-                "SELECT unita_carico FROM prodotti WHERE id = :pid"
-            ), {"pid": self.prodotto_id}).scalar()
+            row = conn.execute(text(
+                "SELECT unita_carico, qta_per_unita_carico, um_qta_per_unita_carico "
+                "FROM prodotti WHERE id = :pid"
+            ), {"pid": self.prodotto_id}).first()
+            self.unita_carico = row[0] if row else None
+            self.qta_per_unita_carico = row[1] if row else None
+            self.um_qta_per_unita_carico = row[2] if row else None
 
         suffisso = " — Fittizio" if mostra_fittizio else ""
         titolo_filter = f" ({azienda_filter})" if azienda_filter else ""
@@ -585,7 +709,9 @@ class DialogRegistroProdotto(QDialog):
         # `unita_carico` se definita guida l'UM di input nel dialog (con
         # conversione automatica verso `um_pulita` al salvataggio).
         if DialogNuovoMovimento(self.engine, self.prodotto_id, self.um_pulita,
-                                self, unita_carico=self.unita_carico).exec():
+                                self, unita_carico=self.unita_carico,
+                                qta_per_unita_carico=self.qta_per_unita_carico,
+                                um_qta_per_unita_carico=self.um_qta_per_unita_carico).exec():
             self.aggiorna_dati()
 
     def _modifica_movimento(self):
@@ -599,7 +725,9 @@ class DialogRegistroProdotto(QDialog):
 
         dati = {"id": r.value("id"), "data": r.value("Data"), "tipo": r.value("Tipo"), "qta": float(r.value(f"Quantità ({self.um_pulita})")), "ddt": r.value("N. DDT"), "fornitore": r.value("Fornitore"), "note": r.value("Note"), "azienda_id": r.value("azienda_id")}
         if DialogModificaMovimento(self.engine, dati, self.um_pulita,
-                                   self, unita_carico=self.unita_carico).exec():
+                                   self, unita_carico=self.unita_carico,
+                                   qta_per_unita_carico=self.qta_per_unita_carico,
+                                   um_qta_per_unita_carico=self.um_qta_per_unita_carico).exec():
             self.aggiorna_dati()
 
     def _elimina_movimento(self):

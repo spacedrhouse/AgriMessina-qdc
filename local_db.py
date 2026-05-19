@@ -104,6 +104,15 @@ def init_local_database(engine: Engine) -> None:
             intervallo_min_tratt INTEGER,
             unita_misura TEXT,
             unita_carico TEXT,
+            -- qta_per_unita_carico: fattore per UM di carico non standard
+            -- (es. "Confezione"). Espresso in `um_qta_per_unita_carico`.
+            -- Es. Orondis: qta_per_unita_carico=575, um_qta_per_unita_carico="ml"
+            -- → 1 Conf = 575 ml; 4 Conf = 2300 ml = 2.3 L in registro.
+            qta_per_unita_carico REAL,
+            -- um_qta_per_unita_carico: UM in cui è espresso qta_per_unita_carico.
+            -- Permette di inserire "575 ml" senza convertire manualmente a L.
+            -- Default = numeratore di unita_misura (se NULL).
+            um_qta_per_unita_carico TEXT,
             min_sostanza REAL, max_sostanza REAL, qta_acqua REAL,
             blacklist TEXT DEFAULT 'No'
         )"""))
@@ -114,6 +123,10 @@ def init_local_database(engine: Engine) -> None:
         cols_p = {r[1] for r in conn.execute(text("PRAGMA table_info(prodotti)")).fetchall()}
         if "unita_carico" not in cols_p:
             conn.execute(text("ALTER TABLE prodotti ADD COLUMN unita_carico TEXT"))
+        if "qta_per_unita_carico" not in cols_p:
+            conn.execute(text("ALTER TABLE prodotti ADD COLUMN qta_per_unita_carico REAL"))
+        if "um_qta_per_unita_carico" not in cols_p:
+            conn.execute(text("ALTER TABLE prodotti ADD COLUMN um_qta_per_unita_carico TEXT"))
 
         # Trattamenti + dettagli
         conn.execute(text("""CREATE TABLE IF NOT EXISTS trattamenti (
@@ -518,6 +531,8 @@ def _install_triggers(conn) -> None:
                     'phi_giorni', NEW.phi_giorni, 'trattamenti_max', NEW.trattamenti_max,
                     'intervallo_min_tratt', NEW.intervallo_min_tratt, 'unita_misura', NEW.unita_misura,
                     'unita_carico', NEW.unita_carico,
+                    'qta_per_unita_carico', NEW.qta_per_unita_carico,
+                    'um_qta_per_unita_carico', NEW.um_qta_per_unita_carico,
                     'min_sostanza', NEW.min_sostanza, 'max_sostanza', NEW.max_sostanza,
                     'qta_acqua', NEW.qta_acqua, 'blacklist', NEW.blacklist
                 ));
@@ -540,6 +555,8 @@ def _install_triggers(conn) -> None:
                OR OLD.intervallo_min_tratt IS NOT NEW.intervallo_min_tratt
                OR OLD.unita_misura IS NOT NEW.unita_misura
                OR OLD.unita_carico IS NOT NEW.unita_carico
+               OR OLD.qta_per_unita_carico IS NOT NEW.qta_per_unita_carico
+               OR OLD.um_qta_per_unita_carico IS NOT NEW.um_qta_per_unita_carico
                OR OLD.min_sostanza IS NOT NEW.min_sostanza
                OR OLD.max_sostanza IS NOT NEW.max_sostanza
                OR OLD.qta_acqua IS NOT NEW.qta_acqua
@@ -555,6 +572,8 @@ def _install_triggers(conn) -> None:
                     'phi_giorni', NEW.phi_giorni, 'trattamenti_max', NEW.trattamenti_max,
                     'intervallo_min_tratt', NEW.intervallo_min_tratt, 'unita_misura', NEW.unita_misura,
                     'unita_carico', NEW.unita_carico,
+                    'qta_per_unita_carico', NEW.qta_per_unita_carico,
+                    'um_qta_per_unita_carico', NEW.um_qta_per_unita_carico,
                     'min_sostanza', NEW.min_sostanza, 'max_sostanza', NEW.max_sostanza,
                     'qta_acqua', NEW.qta_acqua, 'blacklist', NEW.blacklist
                 ));

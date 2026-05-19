@@ -97,6 +97,8 @@ def _upsert_prodotti(engine: Engine, items: list) -> None:
     # supporterà il campo, il valore server prenderà il sopravvento.
     for it in items:
         it.setdefault("unita_carico", None)
+        it.setdefault("qta_per_unita_carico", None)
+        it.setdefault("um_qta_per_unita_carico", None)
     with engine.begin() as conn:
         # ON CONFLICT aggiorna senza cancellare l'ID: i trattamenti collegati
         # non vengono toccati. SQLAlchemy esegue executemany batchando.
@@ -106,13 +108,15 @@ def _upsert_prodotti(engine: Engine, items: list) -> None:
                 sostanza_attiva, bio_convenzionale, avversita,
                 titolo_n, titolo_p, titolo_k,
                 phi_giorni, trattamenti_max, intervallo_min_tratt,
-                unita_misura, unita_carico, min_sostanza, max_sostanza, qta_acqua, blacklist
+                unita_misura, unita_carico, qta_per_unita_carico, um_qta_per_unita_carico,
+                min_sostanza, max_sostanza, qta_acqua, blacklist
             ) VALUES (
                 :id, :nome_prodotto, :categoria, :numero_registrazione,
                 :sostanza_attiva, :bio_convenzionale, :avversita,
                 :titolo_n, :titolo_p, :titolo_k,
                 :phi_giorni, :trattamenti_max, :intervallo_min_tratt,
-                :unita_misura, :unita_carico, :min_sostanza, :max_sostanza, :qta_acqua, :blacklist
+                :unita_misura, :unita_carico, :qta_per_unita_carico, :um_qta_per_unita_carico,
+                :min_sostanza, :max_sostanza, :qta_acqua, :blacklist
             )
             ON CONFLICT(id) DO UPDATE SET
                 nome_prodotto=excluded.nome_prodotto,
@@ -129,6 +133,8 @@ def _upsert_prodotti(engine: Engine, items: list) -> None:
                 intervallo_min_tratt=excluded.intervallo_min_tratt,
                 unita_misura=excluded.unita_misura,
                 unita_carico=COALESCE(excluded.unita_carico, prodotti.unita_carico),
+                qta_per_unita_carico=COALESCE(excluded.qta_per_unita_carico, prodotti.qta_per_unita_carico),
+                um_qta_per_unita_carico=COALESCE(excluded.um_qta_per_unita_carico, prodotti.um_qta_per_unita_carico),
                 min_sostanza=excluded.min_sostanza,
                 max_sostanza=excluded.max_sostanza,
                 qta_acqua=excluded.qta_acqua,
