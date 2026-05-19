@@ -407,20 +407,18 @@ class FinestraPrincipale(QMainWindow):
                       getattr(self, "timer_reconcile", None)):
             if timer is not None and timer.isActive():
                 timer.stop()
-        # Stop SSE listener pulitamente, altrimenti l'app resta appesa sul thread.
-        # `wait(2000)` non garantisce la terminazione: se il thread è bloccato
-        # in una read HTTP che ignora il signal (rete giù, firewall che droppa
-        # senza FIN/RST), restiamo appesi finché il timeout `_READ_TIMEOUT_SECONDS`
-        # di httpx non scade (90s). Aggiungiamo un `quit()` forzato come fallback
-        # quando il wait non ottiene la conferma: invia un quit all'event loop
-        # del thread (QThread.quit) che è più forte di stop()-via-flag.
+        # Stop SSE listener pulitamente. stop() ora chiude anche il client
+        # httpx, quindi un iter_lines() bloccato esce con ReadError e il
+        # thread termina in <100ms invece di aspettare il read_timeout
+        # (fino a 90s). Tieniamo un wait di sicurezza con timeout corto:
+        # se per qualche motivo il thread non esce, logga ma non bloccare
+        # lo shutdown (terminate() è troppo aggressivo per un QThread che
+        # tiene file lock SQLite e socket, può corrompere dati).
         events_listener = getattr(self, "events_listener", None)
         if events_listener is not None and events_listener.isRunning():
             events_listener.stop()
-            if not events_listener.wait(2000):
-                log.warning("EventsListener non terminato in 2s, forzo quit()")
-                events_listener.quit()
-                events_listener.wait(1000)
+            if not events_listener.wait(1500):
+                log.warning("EventsListener non terminato in 1.5s allo shutdown (thread sarà demonizzato)")
         # Update checker: se è ancora in corso (connessione GitHub lenta),
         # l'app può appendersi sul thread. Attendiamo brevemente.
         update_worker = getattr(self, "_update_worker", None)
@@ -643,8 +641,13 @@ class FinestraPrincipale(QMainWindow):
 
             if da_inviare > 0:
                 self.timer_autosync.stop()
-                self._esegui_sync(silenzioso=True)
-                self.timer_autosync.start(self._next_autosync_interval())
+                try:
+                    self._esegui_sync(silenzioso=True)
+                finally:
+                    # Riavvia il timer SEMPRE: se _esegui_sync solleva, senza
+                    # questo finally il polling rapido restava fermo finché
+                    # non si triggerava di nuovo da un altro path.
+                    self.timer_autosync.start(self._next_autosync_interval())
             # Se da_inviare == 0 non facciamo nulla: SSE gestisce il pull.
 
         except Exception as e:
@@ -1143,16 +1146,13 @@ class FinestraPrincipale(QMainWindow):
                     timer.stop()
 
             # Ferma anche il listener SSE: con token scaduto continuerebbe a
-            # provare in loop (anche se il backoff lo rallenta).
+            # provare in loop (anche se il backoff lo rallenta). stop() chiude
+            # il client httpx, quindi un iter_lines() bloccato esce subito.
             events_listener = getattr(self, "events_listener", None)
             if events_listener and events_listener.isRunning():
                 events_listener.stop()
-                # Stesso fallback del closeEvent: se la read HTTP è bloccata,
-                # forziamo quit() per non lasciare l'app appesa sul re-login.
-                if not events_listener.wait(2000):
-                    log.warning("EventsListener non terminato in 2s, forzo quit()")
-                    events_listener.quit()
-                    events_listener.wait(1000)
+                if not events_listener.wait(1500):
+                    log.warning("EventsListener non terminato in 1.5s sul re-login (proseguo)")
 
             # Nascondiamo subito la finestra: la UI del vecchio utente
             # alle spalle del LoginDialog era confondente.

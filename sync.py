@@ -513,6 +513,12 @@ def pull_trattamenti(api: ApiClient, engine: Engine, notifier=None) -> tuple:
         safe_items = [it for it in items if it.get("id") not in protected]
         safe_deletes = [i for i in deleted_ids if i not in protected]
 
+        # Pre-check FK: trattamenti possono referenziare prodotto_id non
+        # ancora sincronizzato (es. nuovo prodotto creato + trattamento subito
+        # dopo da un altro client). Stesso pattern di pull_movimenti.
+        if safe_items:
+            _ensure_parents_for_trattamenti(api, engine, safe_items)
+
         _delete_ids(engine, "trattamenti", safe_deletes)
         _upsert_trattamenti(engine, safe_items)
         set_sync_since(engine, E_TRATTAMENTI, resp.get("server_time"))
@@ -559,6 +565,17 @@ def pull_movimenti(api: ApiClient, engine: Engine, notifier=None) -> tuple:
         safe_items = [it for it in items if it.get("id") not in protected]
         safe_deletes = [i for i in deleted_ids if i not in protected]
 
+        # Pre-check FK: se un movimento referenzia un prodotto_id o azienda_id
+        # non ancora presente localmente, eseguiamo prima un pull mirato delle
+        # entità mancanti. Senza, l'INSERT fallisce con
+        # `FOREIGN KEY constraint failed` e il movimento viene scartato come
+        # "corrotto" (vedi `_upsert_movimenti` savepoint). Lo scenario tipico
+        # è SSE magazzino_changed che arriva PRIMA che il client abbia
+        # pullato il nuovo prodotto referenziato (capita su trattamenti
+        # creati da app mobile + il primo CARICO sul nuovo prodotto).
+        if safe_items:
+            _ensure_parents_for_movimenti(api, engine, safe_items)
+
         _delete_ids(engine, "registro_magazzino", safe_deletes)
         _upsert_movimenti(engine, safe_items)
         set_sync_since(engine, E_MAGAZZINO, resp.get("server_time"))
@@ -566,6 +583,102 @@ def pull_movimenti(api: ApiClient, engine: Engine, notifier=None) -> tuple:
         return (len(safe_items), len(safe_deletes))
     finally:
         set_downloading(engine, False)
+
+
+def _ensure_parents_for_trattamenti(api: ApiClient, engine: Engine, items: list) -> None:
+    """Verifica che `prodotto_id` referenziato nei trattamenti sia presente
+    localmente; se no, pulla i prodotti mancanti. Pattern uguale a
+    `_ensure_parents_for_movimenti` ma specifico per trattamenti."""
+    needed_prods = {it.get("prodotto_id") for it in items if it.get("prodotto_id")}
+    if not needed_prods:
+        return
+    with engine.connect() as conn:
+        ids_csv = ",".join(str(int(p)) for p in needed_prods)
+        existing = {
+            r[0] for r in conn.execute(text(
+                f"SELECT id FROM prodotti WHERE id IN ({ids_csv})"
+            )).fetchall()
+        }
+    missing = needed_prods - existing
+    if not missing:
+        return
+    log.info("Pull trattamenti: %d prodotti FK mancanti — pull mirato", len(missing))
+    try:
+        since = get_sync_since(engine, E_PRODOTTI)
+        resp = api.sync_prodotti(since)
+        _upsert_prodotti(engine, resp.get("items", []))
+        _delete_ids(engine, "prodotti", resp.get("deleted_ids", []))
+        set_sync_since(engine, E_PRODOTTI, resp.get("server_time"))
+    except Exception as e:
+        log.warning("Pull prodotti mirato fallito: %s", e)
+
+
+def _ensure_parents_for_movimenti(api: ApiClient, engine: Engine, items: list) -> None:
+    """Verifica che `prodotto_id`/`azienda_id`/`azienda_id_origine` referenziati
+    nei movimenti siano presenti localmente; se no, pulla i parents mancanti.
+
+    Chiamato in pull_movimenti e in pull_trattamenti (per gli scarichi auto
+    derivati). NON tocca downloading: lo lascia attivo come l'ha trovato.
+    """
+    needed_prods = {it.get("prodotto_id") for it in items if it.get("prodotto_id")}
+    needed_az: set = set()
+    for it in items:
+        for k in ("azienda_id", "azienda_id_origine"):
+            v = it.get(k)
+            if v is not None:
+                needed_az.add(v)
+
+    if not needed_prods and not needed_az:
+        return
+
+    with engine.connect() as conn:
+        existing_prods: set = set()
+        if needed_prods:
+            ids_csv = ",".join(str(int(p)) for p in needed_prods)
+            existing_prods = {
+                r[0] for r in conn.execute(text(
+                    f"SELECT id FROM prodotti WHERE id IN ({ids_csv})"
+                )).fetchall()
+            }
+        existing_az: set = set()
+        if needed_az:
+            ids_csv = ",".join(str(int(a)) for a in needed_az)
+            existing_az = {
+                r[0] for r in conn.execute(text(
+                    f"SELECT id FROM aziende WHERE id IN ({ids_csv})"
+                )).fetchall()
+            }
+
+    missing_prods = needed_prods - existing_prods
+    missing_az = needed_az - existing_az
+
+    if not missing_prods and not missing_az:
+        return
+
+    log.info(
+        "Pull movimenti: parents FK mancanti (prod=%d, az=%d) — pull mirato",
+        len(missing_prods), len(missing_az),
+    )
+    try:
+        if missing_prods:
+            # Full pull dei prodotti: l'endpoint non supporta filtro per id,
+            # serve comunque il delta dall'ultimo since.
+            since = get_sync_since(engine, E_PRODOTTI)
+            resp_p = api.sync_prodotti(since)
+            _upsert_prodotti(engine, resp_p.get("items", []))
+            _delete_ids(engine, "prodotti", resp_p.get("deleted_ids", []))
+            set_sync_since(engine, E_PRODOTTI, resp_p.get("server_time"))
+        if missing_az:
+            since = get_sync_since(engine, E_AZIENDE)
+            resp_a = api.sync_aziende(since)
+            _upsert_aziende(engine, resp_a.get("items", []))
+            _delete_ids(engine, "aziende", resp_a.get("deleted_ids", []))
+            set_sync_since(engine, E_AZIENDE, resp_a.get("server_time"))
+    except Exception as e:
+        # Best-effort: se il pull dei parents fallisce (rete giù, 5xx),
+        # logghiamo ma proseguiamo: il movimento sarà ancora scartato come
+        # corrotto al prossimo upsert, e ritentato al successivo SSE/reconcile.
+        log.warning("Pull parents mirato fallito: %s", e)
 
 
 def sync_all(api: ApiClient, engine: Engine) -> SyncResult:
