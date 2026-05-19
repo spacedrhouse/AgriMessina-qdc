@@ -170,10 +170,13 @@ class WidgetSottoCardBilanciamento(QFrame):
         um = riga_dati.get('Unità Misura') or ''
         um_pulita = um.split('/')[0] if '/' in um else um
 
-        qta = riga_dati.get('Quantità Totale', 0)
-        dose = riga_dati.get('Dose', 0)
-        dose_cum = riga_dati.get('Dose Cumulativa', 0) # <--- Estrazione
-        botti = riga_dati.get('Botti', 0)
+        qta = riga_dati.get('Quantità Totale') or 0
+        dose = riga_dati.get('Dose') or 0
+        # `.get(..., 0)` ritorna `None` quando il valore è esplicitamente NULL
+        # (non quando la chiave manca). Usiamo `or 0` per coprire entrambi i
+        # casi e impedire che `float(None)` finisca nell'except mostrando "None".
+        dose_cum = riga_dati.get('Dose Cumulativa') or 0
+        botti = riga_dati.get('Botti') or 0
 
         try: qta_fmt = f"{float(qta):.4g}"
         except: qta_fmt = str(qta)
@@ -357,10 +360,13 @@ class WidgetTrattamentoCard(QFrame):
         um = riga_dati.get('Unità Misura') or ''
         um_pulita = um.split('/')[0] if '/' in um else um
 
-        qta = riga_dati.get('Quantità Totale', 0)
-        dose = riga_dati.get('Dose', 0)
-        dose_cum = riga_dati.get('Dose Cumulativa', 0) # <--- Estrazione
-        botti = riga_dati.get('Botti', 0)
+        qta = riga_dati.get('Quantità Totale') or 0
+        dose = riga_dati.get('Dose') or 0
+        # `.get(..., 0)` ritorna `None` quando il valore è esplicitamente NULL
+        # (non quando la chiave manca). Usiamo `or 0` per coprire entrambi i
+        # casi e impedire che `float(None)` finisca nell'except mostrando "None".
+        dose_cum = riga_dati.get('Dose Cumulativa') or 0
+        botti = riga_dati.get('Botti') or 0
 
         try: qta_fmt = f"{float(qta):.4g}"
         except: qta_fmt = str(qta)
@@ -955,7 +961,11 @@ class SchedaOperazioni(QWidget):
                     SUM(tvpt.qta_tendone) AS qta_totale,
                     SUM(tvpt.botti_tendone) AS botti_totale,
                     MAX(tvpt.dose_effettiva) AS dose_effettiva,
-                    MAX(tvpt.dose_cumulativa_storica) AS dose_cum_max,
+                    -- COALESCE: se la subquery dose_cumulativa_storica non
+                    -- trova righe (es. tutti i trattamenti del prodotto sul
+                    -- tendone sono "scaduti" rispetto a intervallo_min_tratt),
+                    -- ritorna NULL. Senza COALESCE → card mostra "Tot: None".
+                    COALESCE(MAX(tvpt.dose_cumulativa_storica), 0) AS dose_cum_max,
                     MIN(tvpt.solo_bil) AS solo_bilanciamenti,
                     MAX(
                         CASE

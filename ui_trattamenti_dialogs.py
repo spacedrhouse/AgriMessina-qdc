@@ -2220,7 +2220,11 @@ class DialogNuovoTrattamento(QDialog):
 
         # Botti totali — globali per l'intera operazione (anche multi-prodotto)
         self.spin_botti = QDoubleSpinBox()
-        self.spin_botti.setRange(0.0, 9999.9)
+        # min 1 = vincolo coerente con il check al salva (vedi più sotto):
+        # non ha senso registrare un trattamento con 0 botti. setMinimum impone
+        # anche il default iniziale a 1.0 invece di 0.0, così l'utente parte
+        # subito con un valore valido.
+        self.spin_botti.setRange(1.0, 9999.9)
         self.spin_botti.setSuffix(" Botti")
 
         # Composizione Layout
@@ -2297,6 +2301,12 @@ class DialogNuovoTrattamento(QDialog):
             return
         self.combo_operatore.clear()
         for u in utenti:
+            # Esclude gli ADMIN dalla lista: l'operatore di campo non è (di
+            # solito) un admin. Resta possibile digitare manualmente il
+            # nome di un admin che fa un trattamento occasionale, dato
+            # che la combo è editable=True.
+            if (u.get("ruolo") or "").upper() == "ADMIN":
+                continue
             label = u.get("display_name") or u.get("username") or ""
             if not label:
                 continue
@@ -2429,6 +2439,17 @@ class DialogNuovoTrattamento(QDialog):
             return
 
         botti_tot = self.spin_botti.value()
+        # Botti obbligatorio > 0: serve sia per il calcolo della dose (specie
+        # per prodotti /hl, dove divide la qta per botti×10), sia come dato
+        # tracciabile per il quaderno di campagna. Senza, prima si potevano
+        # registrare trattamenti "senza botti" che generavano dose 0 silente.
+        if botti_tot <= 0:
+            QMessageBox.warning(
+                self,
+                "Numero di botti mancante",
+                "Inserisci un numero di botti maggiore di 0 prima di salvare il trattamento.",
+            )
+            return
         operatore_val = self.combo_operatore.currentText().strip()
         data_tratt = self.date_edit.date().toPyDate()
         data_ins = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
@@ -2706,6 +2727,15 @@ class DialogModificaTrattamento(DialogNuovoTrattamento):
         dati_prod = self.combo_prodotto.currentData()
         qta_tot = self.spin_qta_picker.value()
         botti_tot = self.spin_botti.value()
+        # Botti obbligatorio > 0 anche in modifica: vincolo coerente con
+        # DialogNuovoTrattamento.salva sopra.
+        if botti_tot <= 0:
+            QMessageBox.warning(
+                self,
+                "Numero di botti mancante",
+                "Inserisci un numero di botti maggiore di 0 prima di salvare il trattamento.",
+            )
+            return
 
         if '/hl' in dati_prod.get('um', '').lower():
             divisore = (botti_tot if botti_tot > 0 else tot_area) * 10.0
