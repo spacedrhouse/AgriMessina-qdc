@@ -1439,6 +1439,17 @@ def run():
     # Aggiorna il conteggio iniziale di pending operations dopo lo startup
     finestra._aggiorna_pending_count()
     splash.finish(finestra)
+
+    # Verifica magazzino post-startup (giacenze negative + regola bio
+    # Agrimessina). Solo ADMIN. Errori non bloccano l'app: il modulo logga
+    # internamente e ritorna. Lanciato dopo lo show così il dialog appare
+    # sopra la finestra principale già visibile.
+    try:
+        from magazzino_verifica_dialog import run_verifica_magazzino_on_startup
+        run_verifica_magazzino_on_startup(api, parent=finestra)
+    except Exception:
+        log.exception("verifica magazzino on startup fallita")
+
     sys.exit(app.exec())
 
 

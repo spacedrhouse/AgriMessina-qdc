@@ -801,6 +801,14 @@ class PannelloProdotti(PannelloBaseDialog):
             self.btn_toggle_fittizio.clicked.connect(self._toggle_fittizio)
             top_layout.insertWidget(6, self.btn_toggle_fittizio)
 
+        # Verifica magazzino: lancia auto-apply degli issue univocal e apre
+        # il dialog per gli ambigui. ADMIN-only (l'endpoint richiede admin).
+        if self._is_admin:
+            self.btn_verifica = QPushButton("🛡️ Verifica magazzino")
+            self.btn_verifica.setProperty('class', 'secondary')
+            self.btn_verifica.clicked.connect(self._apri_verifica)
+            top_layout.insertWidget(7, self.btn_verifica)
+
         # Doppio click sui record: ADMIN-only. Apre DialogRegistroProdotto
         # che permette di modificare carichi/scarichi manuali — non ha
         # senso per BASIC che vede solo il fittizio post-revisione.
@@ -821,6 +829,37 @@ class PannelloProdotti(PannelloBaseDialog):
             self.btn_toggle_fittizio.setText("📦 Mostra Reale")
         else:
             self.btn_toggle_fittizio.setText("📋 Mostra Fittizio")
+        self.aggiorna_dati()
+
+    def _apri_verifica(self):
+        """Lancia un auto-apply (univoci) e poi mostra il dialog con gli
+        eventuali residui ambigui. ADMIN-only.
+
+        Errori di rete o 403 vengono mostrati come QMessageBox di warning:
+        diversamente dall'invocazione di startup, qui l'utente ha cliccato
+        esplicitamente e si aspetta un feedback.
+        """
+        from magazzino_verifica_dialog import MagazzinoVerificaDialog
+        try:
+            resp = self.api.auto_apply_verifica()
+        except Exception as e:
+            QMessageBox.warning(self, "Verifica magazzino",
+                                f"Impossibile contattare il server: {e}")
+            return
+        if not isinstance(resp, dict):
+            QMessageBox.warning(self, "Verifica magazzino",
+                                "Risposta server non valida.")
+            return
+        applicati = resp.get("applicati") or {}
+        tot_app = int(applicati.get("bio") or 0) + int(applicati.get("negativi") or 0)
+        if tot_app > 0:
+            QMessageBox.information(
+                self, "Verifica magazzino",
+                f"Applicate {tot_app} correzioni univoche."
+            )
+        residui = resp.get("residui") or {}
+        dlg = MagazzinoVerificaDialog(self.api, residui, parent=self)
+        dlg.exec()
         self.aggiorna_dati()
 
     def _resolve_filter_ids(self) -> list[int]:

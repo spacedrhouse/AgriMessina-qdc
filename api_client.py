@@ -433,6 +433,49 @@ class ApiClient:
         """
         return self._request("POST", "/magazzino/ricalcola")
 
+    # ---- VERIFICA MAGAZZINO -------------------------------------------------
+
+    def get_verifica_magazzino(self) -> Dict[str, Any]:
+        """Lista degli issue magazzino + proposte (admin-only).
+
+        Returns dict { negativi: [...], bio_violations: [...] }.
+        """
+        return self._request("GET", "/magazzino/verifica")
+
+    def auto_apply_verifica(self) -> Dict[str, Any]:
+        """Applica gli issue univocal in sequenza (admin-only).
+
+        Returns dict { applicati: {bio, negativi}, residui: {negativi, bio_violations} }.
+        """
+        return self._request("POST", "/magazzino/verifica/auto-apply", json_body={})
+
+    def applica_verifica_negativo(
+        self,
+        prodotto_id: int,
+        azienda_neg_id: int,
+        azienda_pos_id: int,
+        qta: float,
+        data_movimento: Optional[str] = None,
+    ) -> Dict[str, Any]:
+        """Crea SCARICO/CARICO di compensazione per una giacenza negativa."""
+        body: Dict[str, Any] = {
+            "prodotto_id": prodotto_id,
+            "azienda_neg_id": azienda_neg_id,
+            "azienda_pos_id": azienda_pos_id,
+            "qta": qta,
+        }
+        if data_movimento:
+            body["data_movimento"] = data_movimento
+        return self._request("POST", "/magazzino/verifica/applica-negativo", json_body=body)
+
+    def applica_verifica_bio(self, scarico_id: int, nuova_azienda_id: int) -> Dict[str, Any]:
+        """Riattribuisce uno scarico conv-su-Agrimessina a un altro magazzino."""
+        return self._request(
+            "POST",
+            "/magazzino/verifica/applica-bio",
+            json_body={"scarico_id": scarico_id, "nuova_azienda_id": nuova_azienda_id},
+        )
+
     # ---- AVVISI -------------------------------------------------------------
 
     def sync_avvisi(self, since: Optional[str] = None) -> Dict[str, Any]:
